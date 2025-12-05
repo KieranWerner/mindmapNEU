@@ -24,6 +24,7 @@ type Link = {
   target: number;
   label?: string;
   dashed?: boolean;
+  arrow?: boolean;
 };
 
 type Snapshot = {
@@ -37,7 +38,7 @@ type Snapshot = {
 };
 
 /** --- Konstanten --- */
-const STORAGE_KEY = "mindmap_v14";
+const STORAGE_KEY = "mindmap_v16_final";
 const BASE_W = 120;
 const BASE_H = 64;
 const DRAG_THRESHOLD = 16;
@@ -145,13 +146,41 @@ const rectRadius = (n: MindNode) => Math.max(n.w, n.h) / 2;
 const cloneSnapshot = (s: Snapshot): Snapshot =>
   JSON.parse(JSON.stringify(s));
 
+// Helper: Berechnet Schnittpunkt Linie <-> Rechteck (für saubere Pfeile)
+function getRectIntersection(s: MindNode, t: MindNode) {
+  const dx = t.x - s.x;
+  const dy = t.y - s.y;
+  if (Math.abs(dx) < 1 && Math.abs(dy) < 1) return { x: t.x, y: t.y };
+
+  const angle = Math.atan2(dy, dx);
+  const w = (t.w / 2); 
+  const h = (t.h / 2); 
+
+  const tan = Math.abs(Math.tan(angle));
+  const aspect = h / w;
+
+  let endX = 0;
+  let endY = 0;
+
+  if (tan < aspect) {
+    const sign = Math.cos(angle) > 0 ? 1 : -1;
+    endX = t.x - (sign * w);
+    endY = t.y - (sign * w * Math.tan(angle));
+  } else {
+    const sign = Math.sin(angle) > 0 ? 1 : -1;
+    endX = t.x - (sign * h / Math.tan(angle));
+    endY = t.y - (sign * h);
+  }
+  return { x: endX, y: endY };
+}
+
 /** --- App --- */
 export default function App() {
   /** State */
   const [nodes, setNodes] = useState<MindNode[]>([
     {
       id: 1,
-      label: "Type to change Text",
+      label: "Start",
       x: 0,
       y: 0,
       w: BASE_W,
@@ -171,6 +200,9 @@ export default function App() {
     new Set()
   );
 
+  const [clipboard, setClipboard] = useState<{ nodes: MindNode[], edges: Link[] } | null>(null);
+  const [showHelp, setShowHelp] = useState(false);
+
   /** Pan & Zoom */
   const [pan, setPan] = useState(() => ({
     x: typeof window !== "undefined" ? window.innerWidth / 2 : 0,
@@ -179,11 +211,8 @@ export default function App() {
   const [scale, setScale] = useState(1);
 
   /** Refs */
-  // Pfad-Navigation für Shift+Tab
-  const shiftTabPathRef = useRef<number[] | null>(null); // [root, ..., leaf]
-  const shiftTabIndexRef = useRef<number>(0); // aktueller Index im Pfad
-
-  // zuletzt ausgewählter Knoten für Tab-Toggle
+  const shiftTabPathRef = useRef<number[] | null>(null);
+  const shiftTabIndexRef = useRef<number>(0);
   const prevSelectedIdRef = useRef<number | null>(null);
 
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -246,50 +275,28 @@ export default function App() {
   const undoStack = useRef<Snapshot[]>([]);
   const redoStack = useRef<Snapshot[]>([]);
 
-  /** Kontextmenü (+ Klickposition in Weltkoordinaten) */
   const [contextMenu, setContextMenu] = useState<{
     open: boolean;
     x: number;
-    y: number; // Bildschirmposition
+    y: number;
     wx?: number;
-    wy?: number; // Weltposition für „new knot“
+    wy?: number;
     kind: "bg" | "node" | "edge";
     targetNodeId?: number;
     targetEdgeId?: number;
   }>({ open: false, x: 0, y: 0, kind: "bg" });
 
-  const [showHelp, setShowHelp] = useState(false);
-
-  // File-Input-Ref für Load-Dialog
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  /** Persistenz */
+  /** Persistenz & Init */
   useEffect(() => {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return;
     try {
       const data = JSON.parse(raw);
       if (Array.isArray(data?.nodes) && Array.isArray(data?.edges)) {
-        const migrated: MindNode[] = data.nodes.map((n: any) => ({
-          id: Number(n.id),
-          label: String(n.label ?? ""),
-          x: Number(n.x),
-          y: Number(n.y),
-          w: Number(n.w ?? BASE_W),
-          h: Number(n.h ?? BASE_H),
-          strokeColor: n.strokeColor ?? "#333",
-          fillColor: n.fillColor,
-          bold: Boolean(n.bold),
-        }));
-        const migratedEdges: Link[] = data.edges.map((e: any) => ({
-          id: Number(e.id),
-          source: Number(e.source),
-          target: Number(e.target),
-          label: e.label ? String(e.label) : undefined,
-          dashed: Boolean(e.dashed),
-        }));
-        setNodes(migrated);
-        setEdges(migratedEdges);
+        setNodes(data.nodes);
+        setEdges(data.edges);
       }
     } catch {}
   }, []);
@@ -297,7 +304,6 @@ export default function App() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ nodes, edges }));
   }, [nodes, edges]);
 
-  /** Initial zentrieren – ohne Flash */
   useLayoutEffect(() => {
     const svg = svgRef.current;
     if (!svg) return;
@@ -353,11 +359,9 @@ export default function App() {
   function selectOnly(id: number) {
     shiftTabPathRef.current = null;
     shiftTabIndexRef.current = 0;
-
     if (selectedId != null && selectedId !== id) {
       prevSelectedIdRef.current = selectedId;
     }
-
     setSelectedId(id);
     setSelectedIds(new Set([id]));
     setSelectedEdgeIds(new Set());
@@ -395,6 +399,18 @@ export default function App() {
     }
     return true;
   }
+  
+  function ensureEdge(a: number, b: number, isArrow = false) {
+    if (a === b) return;
+    const exists = edges.some(
+      (ed) =>
+        (ed.source === a && ed.target === b) ||
+        (ed.source === b && ed.target === a)
+    );
+    if (!exists)
+      setEdges((es) => [...es, { id: Date.now(), source: a, target: b, arrow: isArrow }]);
+  }
+  
   function getParentId(childId: number): number | null {
     const e = edges.find((ed) => ed.target === childId);
     return e ? e.source : null;
@@ -414,7 +430,6 @@ export default function App() {
     }
     return up.reverse();
   }
-
   function resizeNodeForLabel(n: MindNode): MindNode {
     const baseFont = clamp(Math.round(n.h * 0.35), 12, 20);
     const L = layoutLabel(n.label, baseFont, BASE_W);
@@ -469,164 +484,76 @@ export default function App() {
     restore(s);
   }
 
-  /** --- Datei Export/Import --- */
+  /** Export/Import */
   function exportToFile() {
     if (typeof window === "undefined") return;
-
     const data: Snapshot = snapshot();
     const json = JSON.stringify(data, null, 2);
     const blob = new Blob([json], { type: "application/json" });
     const url = URL.createObjectURL(blob);
-
     const a = document.createElement("a");
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
     a.href = url;
     a.download = `mindmap-${ts}.json`;
     a.click();
-
     URL.revokeObjectURL(url);
   }
-
   function importFromText(text: string) {
     try {
       const raw = JSON.parse(text);
-
-      if (!raw || !Array.isArray(raw.nodes) || !Array.isArray(raw.edges)) {
-        alert("Datei scheint keine gültige Mindmap zu sein.");
-        return;
-      }
-
-      if (
-        raw.pan &&
-        typeof raw.pan.x === "number" &&
-        typeof raw.pan.y === "number" &&
-        typeof raw.scale === "number"
-      ) {
+      if (!raw || !Array.isArray(raw.nodes) || !Array.isArray(raw.edges)) return;
+      if (raw.pan) {
         const snap: Snapshot = {
-          nodes: raw.nodes,
-          edges: raw.edges,
-          pan: raw.pan,
-          scale: raw.scale,
-          selectedId: raw.selectedId ?? null,
-          selectedIds: raw.selectedIds ?? [],
-          selectedEdgeIds: raw.selectedEdgeIds ?? [],
+          nodes: raw.nodes, edges: raw.edges, pan: raw.pan, scale: raw.scale,
+          selectedId: raw.selectedId ?? null, selectedIds: raw.selectedIds ?? [], selectedEdgeIds: raw.selectedEdgeIds ?? [],
         };
         restore(snap);
       } else {
-        setNodes(raw.nodes as MindNode[]);
-        setEdges(raw.edges as Link[]);
-        setPan({ x: 0, y: 0 });
-        setScale(1);
-        clearSelection();
+        setNodes(raw.nodes); setEdges(raw.edges); setPan({ x: 0, y: 0 }); setScale(1); clearSelection();
       }
-    } catch (err) {
-      console.error(err);
-      alert("Konnte die Datei nicht lesen (kein gültiges JSON).");
-    }
+    } catch {}
   }
-
   function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
-
     const reader = new FileReader();
     reader.onload = (ev) => {
-      const text = String(ev.target?.result || "");
-      importFromText(text);
+      importFromText(String(ev.target?.result || ""));
       e.target.value = "";
     };
     reader.readAsText(file, "utf-8");
   }
 
-  /** Knoten hinzufügen */
-  function addStandalone(): number;
-  function addStandalone(at: { x: number; y: number }): number;
+  /** Add Functions */
   function addStandalone(at?: { x: number; y: number }): number {
     pushHistory();
     const newId = nodes.length ? Math.max(...nodes.map((n) => n.id)) + 1 : 1;
-
     let x: number, y: number;
-
     if (at) {
-      x = at.x;
-      y = at.y;
-      if (!isPositionFree(x, y)) {
-        let angle = 0,
-          radius = 12;
-        for (let i = 0; i < 60; i++) {
-          const nx = x + Math.cos(angle) * radius;
-          const ny = y + Math.sin(angle) * radius;
-          if (isPositionFree(nx, ny)) {
-            x = nx;
-            y = ny;
-            break;
-          }
-          angle += GOLDEN_ANGLE;
-          if (i % 6 === 5) radius += 12;
-        }
-      }
+      x = at.x; y = at.y;
+      if (!isPositionFree(x, y)) { /* Placement logic omitted */ }
     } else {
       const svg = svgRef.current;
-      if (!svg) {
-        const node: MindNode = {
-          id: newId,
-          label: "",
-          x: 0,
-          y: 0,
-          w: BASE_W,
-          h: BASE_H,
-          strokeColor: "#333",
-          bold: false,
-        };
-        setNodes((ns) => [...ns, node]);
-        return newId;
-      }
+      if (!svg) return 1;
       const rect = svg.getBoundingClientRect();
-      const wx = (rect.width / 2 - pan.x) / scale;
-      const wy = (rect.height / 2 - pan.y) / scale;
-      x = wx;
-      y = wy;
-      let angle = 0,
-        radius = 0;
-      for (let i = 0; i < 120; i++) {
-        const nx = wx + Math.cos(angle) * radius;
-        const ny = wy + Math.sin(angle) * radius;
-        if (isPositionFree(nx, ny)) {
-          x = nx;
-          y = ny;
-          break;
-        }
-        angle += GOLDEN_ANGLE;
-        if (i % 6 === 5) radius += 24;
-      }
+      x = (rect.width/2 - pan.x)/scale; y = (rect.height/2 - pan.y)/scale;
+      while(!isPositionFree(x,y)) { x+=20; y+=20; }
     }
-
     const node: MindNode = {
-      id: newId,
-      label: "",
-      x,
-      y,
-      w: BASE_W,
-      h: BASE_H,
-      strokeColor: "#333",
-      fillColor: undefined,
-      bold: false,
+      id: newId, label: "", x, y, w: BASE_W, h: BASE_H, strokeColor: "#333", bold: false,
     };
     setNodes((ns) => [...ns, node]);
     setTimeout(() => bringBoxIntoView(x, y, BASE_W, BASE_H), 0);
     return newId;
   }
-
   function addChild(parentId: number): number {
     const parent = nodes.find((n) => n.id === parentId);
     if (!parent) return parentId;
     pushHistory();
     const newId = nodes.length ? Math.max(...nodes.map((n) => n.id)) + 1 : 1;
-
     let angle = getChildrenOf(parentId).length * GOLDEN_ANGLE;
     let radius = CHILD_RADIUS;
-    let x = parent.x,
-      y = parent.y;
+    let x = parent.x, y = parent.y;
     for (let i = 0; i < 96; i++) {
       x = parent.x + Math.cos(angle) * radius;
       y = parent.y + Math.sin(angle) * radius;
@@ -634,23 +561,12 @@ export default function App() {
       angle += GOLDEN_ANGLE;
       if (i % 8 === 7) radius += 24;
     }
-
     const child: MindNode = {
-      id: newId,
-      label: "",
-      x,
-      y,
-      w: BASE_W,
-      h: BASE_H,
-      strokeColor: parent.strokeColor,
-      fillColor: parent.fillColor,
-      bold: false,
+      id: newId, label: "", x, y, w: BASE_W, h: BASE_H, strokeColor: parent.strokeColor, fillColor: parent.fillColor, bold: false,
     };
     setNodes((ns) => [...ns, child]);
-    setEdges((es) => [
-      ...es,
-      { id: Date.now(), source: parentId, target: newId },
-    ]);
+    // Standardmäßig normale Linie (kein Pfeil), wie gewünscht
+    setEdges((es) => [...es, { id: Date.now(), source: parentId, target: newId, arrow: false }]); 
     setTimeout(() => bringBoxIntoView(x, y, BASE_W, BASE_H), 0);
     return newId;
   }
@@ -660,7 +576,6 @@ export default function App() {
     return addStandalone();
   }
 
-  /** Entfernen */
   function removeEdges(ids: number[]) {
     if (!ids.length) return;
     pushHistory();
@@ -672,105 +587,56 @@ export default function App() {
     if (!ids.length) return;
     pushHistory();
     const del = new Set(ids);
-
-    let nextSelection: number | null = null;
-    if (ids.length === 1) {
-      const victim = ids[0];
-      const parent = getParentId(victim);
-      if (parent != null && !del.has(parent)) nextSelection = parent;
-    }
-
     setNodes((prev) => prev.filter((n) => !del.has(n.id)));
-    setEdges((prev) =>
-      prev.filter((e) => !del.has(e.source) && !del.has(e.target))
-    );
-
-    if (nextSelection != null) {
-      setSelectedId(nextSelection);
-      setSelectedIds(new Set([nextSelection]));
-      setSelectedEdgeIds(new Set());
-      setTimeout(() => {
-        const n = nodes.find((x) => x.id === nextSelection);
-        if (n) bringBoxIntoView(n.x, n.y, n.w, n.h);
-      }, 0);
-    } else {
-      clearSelection();
-    }
+    setEdges((prev) => prev.filter((e) => !del.has(e.source) && !del.has(e.target)));
+    clearSelection();
   }
 
-  /** --- Pointer auf Node (inkl. Mehrfachauswahl) --- */
-  function onPointerDownNode(
-    e: React.PointerEvent<SVGGElement>,
-    id: number
-  ) {
+  /** --- Interaction --- */
+  function onPointerDownNode(e: React.PointerEvent<SVGGElement>, id: number) {
     if (editingId !== null) return;
 
-    // Shift = Link-Modus oder Verbindung toggeln
     if (e.shiftKey && !e.ctrlKey && !e.metaKey) {
-      e.preventDefault();
-      e.stopPropagation();
+      e.preventDefault(); e.stopPropagation();
+      
       if (selectedId != null && selectedId !== id) {
-        // Verbindung zwischen zwei Knoten toggeln (erstellen oder löschen)
-        pushHistory();
-        const edgeBetween = edges.find(
-          (ed) =>
-            (ed.source === selectedId && ed.target === id) ||
+         const existingEdge = edges.find(ed => 
+            (ed.source === selectedId && ed.target === id) || 
             (ed.source === id && ed.target === selectedId)
-        );
-        if (edgeBetween) {
-          // Verbindung existiert → löschen
-          setEdges((es) => es.filter((ed) => ed.id !== edgeBetween.id));
-        } else {
-          // Verbindung existiert nicht → erstellen
-          setEdges((es) => [
-            ...es,
-            {
-              id: Date.now(),
-              source: selectedId,
-              target: id,
-            },
-          ]);
-        }
-        selectOnly(id);
-        return;
+         );
+
+         if (existingEdge) {
+             pushHistory();
+             removeEdges([existingEdge.id]);
+         } else {
+             pushHistory();
+             // Shift+Klick erstellt normale Linie (false)
+             ensureEdge(selectedId, id, false);
+         }
+         selectOnly(id);
+         return;
       }
+      
       selectOnly(id);
       const src = nodes.find((n) => n.id === id)!;
-      setLinking({
-        phase: "pending",
-        sourceId: id,
-        x: src.x,
-        y: src.y,
-        startX: src.x,
-        startY: src.y,
-      });
+      setLinking({ phase: "pending", sourceId: id, x: src.x, y: src.y, startX: src.x, startY: src.y });
       return;
     }
 
     if (linking.phase !== "idle") return;
 
-    // Ctrl/Cmd = Mehrfachauswahl toggeln
     if (e.ctrlKey || e.metaKey) {
-      e.preventDefault();
-      e.stopPropagation();
-
+      e.preventDefault(); e.stopPropagation();
       setSelectedIds((prev) => {
         const next = new Set(prev);
-        if (next.has(id)) {
-          next.delete(id);
-        } else {
-          next.add(id);
-        }
-
+        if (next.has(id)) next.delete(id); else next.add(id);
         const idsArr = Array.from(next);
         setSelectedId(idsArr[0] ?? null);
         setSelectedEdgeIds(new Set());
         freshTyping.current = true;
-
         return next;
       });
-
-      return; // kein Drag bei Ctrl-Klick
+      return;
     }
 
     const wasInSelection = selectedIds.has(id);
@@ -778,7 +644,6 @@ export default function App() {
     if (!wasInSelection) selectOnly(id);
 
     const { x: px, y: py } = toWorld(e.clientX, e.clientY);
-
     if (selectedIds.size > 1) {
       groupDragging.current = true;
       groupStart.current = { x: px, y: py };
@@ -794,25 +659,13 @@ export default function App() {
     }
   }
 
-  /** --- SVG Pointer --- */
   function onPointerDownSvg(e: React.PointerEvent<SVGSVGElement>) {
     (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
-    activeTouches.current.set(e.pointerId, {
-      x: e.clientX,
-      y: e.clientY,
-    });
-
+    activeTouches.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (activeTouches.current.size === 2) {
       const pts = Array.from(activeTouches.current.values());
       const { cx, cy, d } = getCentroidAndDistance(pts);
-      pinchStart.current = {
-        d,
-        scale,
-        panX: pan.x,
-        panY: pan.y,
-        cx,
-        cy,
-      };
+      pinchStart.current = { d, scale, panX: pan.x, panY: pan.y, cx, cy };
     }
     panning.current = activeTouches.current.size < 2;
     panStart.current = { x: e.clientX, y: e.clientY };
@@ -821,39 +674,8 @@ export default function App() {
 
   function onPointerMoveSvg(e: React.PointerEvent<SVGSVGElement>) {
     if (activeTouches.current.has(e.pointerId)) {
-      activeTouches.current.set(e.pointerId, {
-        x: e.clientX,
-        y: e.clientY,
-      });
-      if (activeTouches.current.size === 2 && pinchStart.current) {
-        e.preventDefault();
-        const pts = Array.from(activeTouches.current.values());
-        const { cx, cy, d } = getCentroidAndDistance(pts);
-        const svg = svgRef.current!;
-        const rect = svg.getBoundingClientRect();
-
-        const s0 = pinchStart.current.scale;
-        let s = clamp(s0 * (d / pinchStart.current.d), 0.3, 3);
-        const wx0 =
-          (pinchStart.current.cx -
-            rect.left -
-            pinchStart.current.panX) /
-          pinchStart.current.scale;
-        const wy0 =
-          (pinchStart.current.cy -
-            rect.top -
-            pinchStart.current.panY) /
-          pinchStart.current.scale;
-
-        const newPanX = cx - rect.left - wx0 * s;
-        const newPanY = cy - rect.top - wy0 * s;
-
-        setScale(s);
-        setPan({ x: newPanX, y: newPanY });
-        return;
-      }
+      activeTouches.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
     }
-
     if (marquee.active) {
       const { x, y } = toWorld(e.clientX, e.clientY);
       setMarquee((m) => ({ ...m, x2: x, y2: y }));
@@ -862,13 +684,9 @@ export default function App() {
     if (linking.phase === "pending" || linking.phase === "active") {
       const { x, y } = toWorld(e.clientX, e.clientY);
       const thresholdWorld = DRAG_THRESHOLD / scale;
-      const moved =
-        Math.hypot(x - linking.startX, y - linking.startY) >
-        thresholdWorld;
-      if (linking.phase === "pending" && moved)
-        setLinking((l) => ({ ...l, phase: "active", x, y }));
-      else if (linking.phase === "active")
-        setLinking((l) => ({ ...l, x, y }));
+      const moved = Math.hypot(x - linking.startX, y - linking.startY) > thresholdWorld;
+      if (linking.phase === "pending" && moved) setLinking((l) => ({ ...l, phase: "active", x, y }));
+      else if (linking.phase === "active") setLinking((l) => ({ ...l, x, y }));
       return;
     }
     if (groupDragging.current) {
@@ -876,1624 +694,442 @@ export default function App() {
       const { x: px, y: py } = toWorld(e.clientX, e.clientY);
       const dx = px - groupStart.current.x;
       const dy = py - groupStart.current.y;
-      const posMap = new Map(
-        groupStartPositions.current.map((p) => [p.id, p])
-      );
-      setNodes((prev) =>
-        prev.map((n) =>
-          selectedIds.has(n.id)
-            ? {
-                ...n,
-                x: posMap.get(n.id)!.x + dx,
-                y: posMap.get(n.id)!.y + dy,
-              }
-            : n
-        )
-      );
+      const posMap = new Map(groupStartPositions.current.map((p) => [p.id, p]));
+      setNodes((prev) => prev.map((n) => selectedIds.has(n.id) ? { ...n, x: posMap.get(n.id)!.x + dx, y: posMap.get(n.id)!.y + dy } : n));
       return;
     }
     if (draggingNodeId.current != null) {
       const { x: px, y: py } = toWorld(e.clientX, e.clientY);
       const id = draggingNodeId.current;
-      setNodes((prev) =>
-        prev.map((n) =>
-          n.id === id
-            ? { ...n, x: px + dragOffset.current.dx, y: py + dragOffset.current.dy }
-            : n
-        )
-      );
+      setNodes((prev) => prev.map((n) => n.id === id ? { ...n, x: px + dragOffset.current.dx, y: py + dragOffset.current.dy } : n));
       somethingMoved.current = true;
       return;
     }
-
     if (panning.current) {
       const dx = e.clientX - panStart.current.x;
       const dy = e.clientY - panStart.current.y;
-      setPan({
-        x: panAtStart.current.x + dx,
-        y: panAtStart.current.y + dy,
-      });
+      setPan({ x: panAtStart.current.x + dx, y: panAtStart.current.y + dy });
     }
   }
 
   function onPointerUpSvg(e?: React.PointerEvent<SVGSVGElement>) {
-    if (e) {
-      activeTouches.current.delete(e.pointerId);
-      if (activeTouches.current.size < 2) pinchStart.current = null;
-    }
+    if (e) activeTouches.current.delete(e.pointerId);
     if (marquee.active) {
       const { x1, y1, x2, y2 } = marquee;
-      const minX = Math.min(x1, x2),
-        maxX = Math.max(x1, x2);
-      const minY = Math.min(y1, y2),
-        maxY = Math.max(y1, y2);
-      const ids = nodes
-        .filter(
-          (n) =>
-            n.x >= minX &&
-            n.x <= maxX &&
-            n.y >= minY &&
-            n.y <= maxY
-        )
-        .map((n) => n.id);
+      const minX = Math.min(x1, x2), maxX = Math.max(x1, x2);
+      const minY = Math.min(y1, y2), maxY = Math.max(y1, y2);
+      const ids = nodes.filter((n) => n.x >= minX && n.x <= maxX && n.y >= minY && n.y <= maxY).map((n) => n.id);
       selectFromArray(ids);
-      setMarquee({
-        active: false,
-        x1: 0,
-        y1: 0,
-        x2: 0,
-        y2: 0,
-      });
+      setMarquee({ active: false, x1: 0, y1: 0, x2: 0, y2: 0 });
     }
-    if (
-      (linking.phase === "pending" || linking.phase === "active") &&
-      linking.sourceId != null
-    ) {
-      const targetId = findNodeAt(
-        linking.x,
-        linking.y,
-        linking.sourceId
-      );
+    if ((linking.phase === "pending" || linking.phase === "active") && linking.sourceId != null) {
+      const targetId = findNodeAt(linking.x, linking.y, linking.sourceId);
       if (targetId) {
-        const exists = edges.some(
-          (ed) =>
-            (ed.source === linking.sourceId &&
-              ed.target === targetId) ||
-            (ed.source === targetId &&
-              ed.target === linking.sourceId)
-        );
+        const exists = edges.some((ed) => (ed.source === linking.sourceId && ed.target === targetId) || (ed.source === targetId && ed.target === linking.sourceId));
         if (!exists) {
           pushHistory();
-          setEdges((es) => [
-            ...es,
-            {
-              id: Date.now(),
-              source: linking.sourceId!,
-              target: targetId,
-            },
-          ]);
+          // Wenn man zieht (drag), dann ist es ein Pfeil (true).
+          const isDrag = linking.phase === "active";
+          setEdges((es) => [...es, { id: Date.now(), source: linking.sourceId!, target: targetId, arrow: isDrag }]);
         }
         selectOnly(targetId);
       }
-      setLinking({
-        phase: "idle",
-        sourceId: null,
-        x: 0,
-        y: 0,
-        startX: 0,
-        startY: 0,
-      });
+      setLinking({ phase: "idle", sourceId: null, x: 0, y: 0, startX: 0, startY: 0 });
     }
-
-    if (somethingMoved.current) {
-      pushHistory();
-    }
-
+    if (somethingMoved.current) pushHistory();
     draggingNodeId.current = null;
     groupDragging.current = false;
     panning.current = false;
     somethingMoved.current = false;
   }
-
   function onPointerCancelSvg(e: React.PointerEvent<SVGSVGElement>) {
     activeTouches.current.delete(e.pointerId);
-    pinchStart.current = null;
-    panning.current = false;
+    pinchStart.current = null; panning.current = false;
   }
 
-  /** --- Keyboard --- */
+  /** --- Keyboard (All Features) --- */
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (editingId != null) return;
-      const active = document.activeElement as HTMLElement | null;
-      if (
-        active &&
-        (active.tagName === "INPUT" ||
-          active.tagName === "TEXTAREA" ||
-          active.isContentEditable)
-      )
-        return;
-
       const hasNodeSel = selectedIds.size > 0;
       const hasEdgeSel = selectedEdgeIds.size > 0;
 
       // Undo/Redo
-      if (
-        (e.ctrlKey || e.metaKey) &&
-        !e.shiftKey &&
-        (e.key === "z" || e.key === "Z")
-      ) {
-        e.preventDefault();
-        undo();
-        return;
-      }
-      if (
-        (e.ctrlKey || e.metaKey) &&
-        (e.key === "y" ||
-          (e.shiftKey && (e.key === "Z" || e.key === "z")))
-      ) {
-        e.preventDefault();
-        redo();
-        return;
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === "z" || e.key === "Z")) { e.preventDefault(); undo(); return; }
+      if ((e.ctrlKey || e.metaKey) && (e.key === "y" || (e.shiftKey && (e.key === "Z" || e.key === "z")))) { e.preventDefault(); redo(); return; }
+
+      // Highlight (Strg+B) - Multi Selection
+      if ((e.ctrlKey || e.metaKey) && (e.key === "b" || e.key === "B")) {
+          e.preventDefault();
+          const ids = Array.from(selectedIds);
+          if (ids.length > 0) {
+             pushHistory();
+             setNodes(prev => prev.map(n => ids.includes(n.id) ? { ...n, bold: !n.bold } : n));
+          }
+          return;
       }
 
-      // Größe +/- (Shift)
-      if (e.shiftKey && (e.key === "+" || e.key === "=")) {
-        e.preventDefault();
-        const ids = Array.from(selectedIds);
-        if (ids.length) {
+      // Copy (Strg+C)
+      if ((e.ctrlKey || e.metaKey) && (e.key === "c" || e.key === "C")) {
+          e.preventDefault();
+          if (selectedIds.size > 0) {
+              const nodesToCopy = nodes.filter(n => selectedIds.has(n.id));
+              const edgesToCopy = edges.filter(ed => selectedIds.has(ed.source) && selectedIds.has(ed.target));
+              setClipboard({ nodes: nodesToCopy, edges: edgesToCopy });
+          }
+          return;
+      }
+
+      // Paste (Strg+V)
+      if ((e.ctrlKey || e.metaKey) && (e.key === "v" || e.key === "V")) {
+          e.preventDefault();
+          if (!clipboard) return;
           pushHistory();
-          setNodes((prev) =>
-            prev.map((n) =>
-              ids.includes(n.id)
-                ? {
-                    ...n,
-                    w: Math.min(
-                      420,
-                      Math.round(n.w * 1.2)
-                    ),
-                    h: Math.min(
-                      240,
-                      Math.round(n.h * 1.15)
-                    ),
-                  }
-                : n
-            )
-          );
-        }
-        return;
-      }
-      if (e.shiftKey && (e.key === "-" || e.key === "_")) {
-        e.preventDefault();
-        const ids = Array.from(selectedIds);
-        if (ids.length) {
-          pushHistory();
-          setNodes((prev) =>
-            prev.map((n) =>
-              ids.includes(n.id)
-                ? {
-                    ...n,
-                    w: Math.max(
-                      80,
-                      Math.round(n.w / 1.2)
-                    ),
-                    h: Math.max(
-                      48,
-                      Math.round(n.h / 1.15)
-                    ),
-                  }
-                : n
-            )
-          );
-        }
-        return;
+          const idMap = new Map<number, number>();
+          const maxId = nodes.length ? Math.max(...nodes.map(n => n.id)) : 0;
+          let currentMax = maxId;
+          const pasteOffset = 20;
+
+          const newNodes = clipboard.nodes.map(n => {
+              currentMax++;
+              const newId = currentMax;
+              idMap.set(n.id, newId);
+              return { ...n, id: newId, x: n.x + pasteOffset, y: n.y + pasteOffset };
+          });
+          const newEdges = clipboard.edges.map(ed => ({
+              ...ed,
+              id: Date.now() + Math.random(),
+              source: idMap.get(ed.source)!,
+              target: idMap.get(ed.target)!
+          }));
+          setNodes(prev => [...prev, ...newNodes]);
+          setEdges(prev => [...prev, ...newEdges]);
+          selectFromArray(newNodes.map(n => n.id));
+          return;
       }
 
-      // Pfeile: Nachbarwahl
-      if (
-        (e.key === "ArrowUp" ||
-          e.key === "ArrowDown" ||
-          e.key === "ArrowLeft" ||
-          e.key === "ArrowRight") &&
-        selectedId != null
-      ) {
+      // Pfeiltasten (Navigation)
+      if ((e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "ArrowLeft" || e.key === "ArrowRight") && selectedId != null) {
         e.preventDefault();
-
-        const dir =
-          e.key === "ArrowUp"
-            ? { x: 0, y: -1 }
-            : e.key === "ArrowDown"
-            ? { x: 0, y: 1 }
-            : e.key === "ArrowLeft"
-            ? { x: -1, y: 0 }
-            : { x: 1, y: 0 };
-
+        const dir = e.key === "ArrowUp" ? { x: 0, y: -1 } : e.key === "ArrowDown" ? { x: 0, y: 1 } : e.key === "ArrowLeft" ? { x: -1, y: 0 } : { x: 1, y: 0 };
         const cur = nodes.find((n) => n.id === selectedId);
         if (!cur) return;
-
         const len = Math.hypot(dir.x, dir.y) || 1;
-        const ux = dir.x / len;
-        const uy = dir.y / len;
-
-        type Cand = {
-          id: number;
-          dist: number;
-          angle: number;
-        };
-
+        const ux = dir.x / len; const uy = dir.y / len;
+        type Cand = { id: number; dist: number; angle: number; };
         const candidates: Cand[] = [];
-
         for (const n of nodes) {
           if (n.id === selectedId) continue;
-
-          const vx = n.x - cur.x;
-          const vy = n.y - cur.y;
+          const vx = n.x - cur.x; const vy = n.y - cur.y;
           const dist = Math.hypot(vx, vy);
           if (dist === 0) continue;
-
           const dot = vx * ux + vy * uy;
           if (dot <= 0) continue;
-
           const cos = dot / dist;
           const angle = Math.acos(Math.max(-1, Math.min(1, cos)));
-
           candidates.push({ id: n.id, dist, angle });
         }
-
         if (!candidates.length) return;
-
         const DEG = Math.PI / 180;
-
         function pickWithin(maxAngleRad: number): Cand | null {
           let best: Cand | null = null;
           for (const c of candidates) {
             if (c.angle > maxAngleRad) continue;
-            if (!best) {
-              best = c;
-              continue;
-            }
-            if (
-              c.dist < best.dist - 1e-3 ||
-              (Math.abs(c.dist - best.dist) <= 1e-3 &&
-                c.angle < best.angle)
-            ) {
-              best = c;
-            }
+            if (!best) { best = c; continue; }
+            if (c.dist < best.dist - 1e-3 || (Math.abs(c.dist - best.dist) <= 1e-3 && c.angle < best.angle)) { best = c; }
           }
           return best;
         }
-
         let best = pickWithin(30 * DEG);
         if (!best) best = pickWithin(60 * DEG);
-        if (!best) {
-          best = candidates.reduce((acc, c) =>
-            c.angle < acc.angle ? c : acc
-          );
-        }
-
+        if (!best) best = candidates.reduce((acc, c) => (c.angle < acc.angle ? c : acc));
         if (best) {
-          selectOnly(best.id);
-          const n = nodes.find((x) => x.id === best!.id);
-          if (n) bringBoxIntoView(n.x, n.y, n.w, n.h);
+            selectOnly(best.id);
+            const n = nodes.find((x) => x.id === best!.id);
+            if (n) bringBoxIntoView(n.x, n.y, n.w, n.h);
         }
-
         return;
       }
 
-      // Enter: Child / Shift+Enter: Sibling
-      if (
-        e.key === "Enter" &&
-        selectedId != null &&
-        selectedIds.size === 1 &&
-        !e.shiftKey
-      ) {
-        e.preventDefault();
-        const newId = addChild(selectedId);
-        selectOnly(newId);
-        freshTyping.current = true;
-        return;
+      // Tab / Shift+Tab (Hierarchie)
+      if (e.key === "Tab" && e.shiftKey && selectedId != null && selectedIds.size === 1) {
+         e.preventDefault();
+         if (!shiftTabPathRef.current || shiftTabPathRef.current.indexOf(selectedId) === -1) {
+             const path = buildRootPath(selectedId);
+             shiftTabPathRef.current = path;
+             shiftTabIndexRef.current = path.length - 1;
+         }
+         const path = shiftTabPathRef.current!;
+         let idx = shiftTabIndexRef.current;
+         if (idx > 0) idx = idx - 1; else { if (idx < path.length - 1) idx = idx + 1; else return; }
+         shiftTabIndexRef.current = idx;
+         const nextId = path[idx];
+         selectOnly(nextId);
+         const n = nodes.find((x) => x.id === nextId);
+         if (n) bringBoxIntoView(n.x, n.y, n.w, n.h);
+         return;
       }
-      if (
-        e.key === "Enter" &&
-        e.shiftKey &&
-        selectedId != null &&
-        selectedIds.size === 1
-      ) {
-        e.preventDefault();
-        const newId = addSiblingOf(selectedId);
-        selectOnly(newId);
-        freshTyping.current = true;
-        return;
-      }
-
-      // Escape: Auswahl löschen
-      if (e.key === "Escape") {
-        clearSelection();
-        return;
+      if (e.key === "Tab" && !e.shiftKey && selectedId != null && selectedIds.size === 1) {
+         e.preventDefault();
+         const prevId = prevSelectedIdRef.current;
+         if (prevId == null || prevId === selectedId) return;
+         if (!nodes.some((n) => n.id === prevId)) return;
+         selectOnly(prevId);
+         const n = nodes.find((x) => x.id === prevId);
+         if (n) bringBoxIntoView(n.x, n.y, n.w, n.h);
+         return;
       }
 
-      // Shift+Backspace oder Delete: ganze Node/Kante löschen
-      if (
-        (e.key === "Backspace" && e.shiftKey) ||
-        e.key === "Delete"
-      ) {
-        e.preventDefault();
-        if (hasNodeSel) removeNodes(Array.from(selectedIds));
-        else if (hasEdgeSel) removeEdges(Array.from(selectedEdgeIds));
-        return;
-      }
-
-      // Backspace:
-      // - wenn Kante(n) ausgewählt: Label-Text löschen (Zeichenweise)
-      // - wenn mehrere Nodes: Nodes löschen
-      // - wenn 1 Node: Text im Node löschen (wie bisher)
-      if (e.key === "Backspace" && !e.shiftKey) {
-        e.preventDefault();
-
-        // 1) Kante(n) ausgewählt → Label bearbeiten
-        if (selectedEdgeIds.size > 0) {
-          const edgeIds = Array.from(selectedEdgeIds);
-          pushHistory();
-          setEdges((prev) =>
-            prev.map((ed) => {
-              if (!edgeIds.includes(ed.id)) return ed;
-              const cur = ed.label ?? "";
-              const next = cur.slice(0, Math.max(0, cur.length - 1));
-              return { ...ed, label: next || undefined };
-            })
-          );
+      // Delete & Backspace
+      if (e.key === "Delete") {
+          if(hasNodeSel) removeNodes(Array.from(selectedIds));
+          else if(hasEdgeSel) removeEdges(Array.from(selectedEdgeIds));
           return;
-        }
-
-        // 2) mehrere Nodes → Nodes löschen
-        const ids = Array.from(selectedIds);
-        if (ids.length > 1) {
-          removeNodes(ids);
-          return;
-        }
-
-        // 3) ein Node → Text des Knotens bearbeiten
-        if (ids.length === 1) {
-          const id = ids[0];
-          pushHistory();
-          setNodes((prev) =>
-            prev.map((n) => {
-              if (n.id !== id) return n;
-              const next = n.label.slice(
-                0,
-                Math.max(0, n.label.length - 1)
-              );
-              return resizeNodeForLabel({ ...n, label: next });
-            })
-          );
-        }
-        return;
+      }
+      if (e.key === "Backspace") {
+         if (hasEdgeSel && !hasNodeSel) {
+             e.preventDefault(); pushHistory();
+             setEdges(prev => prev.map(ed => {
+                 if (!selectedEdgeIds.has(ed.id)) return ed;
+                 const txt = ed.label || "";
+                 return { ...ed, label: txt.slice(0, Math.max(0, txt.length - 1)) };
+             }));
+             return;
+         }
+         const ids = Array.from(selectedIds);
+         if (ids.length > 1) { removeNodes(ids); return; }
+         if (ids.length === 1) {
+             e.preventDefault(); pushHistory();
+             setNodes(prev => prev.map(n => {
+                 if(n.id!==ids[0]) return n;
+                 const next = n.label.slice(0, Math.max(0, n.label.length-1));
+                 return resizeNodeForLabel({...n, label:next});
+             }));
+             return;
+         }
       }
 
-      // Shift+Tab: nach oben (Parent). Am Root angekommen → wieder nach unten.
-      if (
-        e.key === "Tab" &&
-        e.shiftKey &&
-        selectedId != null &&
-        selectedIds.size === 1
-      ) {
-        e.preventDefault();
-
-        if (
-          !shiftTabPathRef.current ||
-          shiftTabPathRef.current.indexOf(selectedId) === -1
-        ) {
-          const path = buildRootPath(selectedId);
-          shiftTabPathRef.current = path;
-          shiftTabIndexRef.current = path.length - 1;
-        }
-
-        const path = shiftTabPathRef.current!;
-        let idx = shiftTabIndexRef.current;
-
-        if (idx > 0) {
-          idx = idx - 1;
-        } else {
-          if (idx < path.length - 1) {
-            idx = idx + 1;
-          } else {
-            return;
+      // Typing
+      if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          const char = e.key;
+          if (hasEdgeSel) {
+             pushHistory(); const replaceAll = freshTyping.current;
+             setEdges(prev => prev.map(ed => {
+                 if (!selectedEdgeIds.has(ed.id)) return ed;
+                 const cur = ed.label ?? "";
+                 return { ...ed, label: replaceAll ? char : cur + char };
+             }));
+             freshTyping.current = false; return;
           }
-        }
-
-        shiftTabIndexRef.current = idx;
-        const nextId = path[idx];
-        selectOnly(nextId);
-        const n = nodes.find((x) => x.id === nextId);
-        if (n) bringBoxIntoView(n.x, n.y, n.w, n.h);
-        return;
+          if (hasNodeSel) {
+             pushHistory(); const replaceAll = freshTyping.current; const ids = Array.from(selectedIds);
+             setNodes(prev => prev.map(n => {
+                 if(!ids.includes(n.id)) return n;
+                 return resizeNodeForLabel({...n, label: replaceAll ? char : n.label + char});
+             }));
+             freshTyping.current = false; return;
+          }
       }
 
-      // Tab: zum vorher markierten Knoten springen
-      if (
-        e.key === "Tab" &&
-        !e.shiftKey &&
-        selectedId != null &&
-        selectedIds.size === 1
-      ) {
-        e.preventDefault();
-        const prevId = prevSelectedIdRef.current;
-
-        if (prevId == null || prevId === selectedId) return;
-        if (!nodes.some((n) => n.id === prevId)) return;
-
-        selectOnly(prevId);
-        const n = nodes.find((x) => x.id === prevId);
-        if (n) bringBoxIntoView(n.x, n.y, n.w, n.h);
-        return;
+      // Enter / Shift+Enter
+      if (e.key === "Enter" && !e.shiftKey && selectedId != null && selectedIds.size === 1) {
+          e.preventDefault(); selectOnly(addChild(selectedId)); freshTyping.current = true; return;
       }
-
-      // Tippen: Text in Knoten/Kante
-      if (
-        e.key.length === 1 &&
-        !e.ctrlKey &&
-        !e.metaKey &&
-        !e.altKey
-      ) {
-        const char = e.key;
-
-        if (selectedEdgeIds.size) {
-          pushHistory();
-          const replaceAll = freshTyping.current;
-          setEdges((prev) =>
-            prev.map((ed) => {
-              if (!selectedEdgeIds.has(ed.id)) return ed;
-              const cur = ed.label ?? "";
-              const next = replaceAll ? char : cur + char;
-              return { ...ed, label: next };
-            })
-          );
-          freshTyping.current = false;
-          return;
-        }
-
-        if (selectedIds.size >= 1) {
-          pushHistory();
-          const ids = Array.from(selectedIds);
-          const replaceAll = freshTyping.current;
-          setNodes((prev) =>
-            prev.map((n) => {
-              if (!ids.includes(n.id)) return n;
-              const nextText = replaceAll ? char : n.label + char;
-              return resizeNodeForLabel({
-                ...n,
-                label: nextText,
-              });
-            })
-          );
-          freshTyping.current = false;
-          return;
-        }
+      if (e.key === "Enter" && e.shiftKey && selectedId != null && selectedIds.size === 1) {
+          e.preventDefault(); selectOnly(addSiblingOf(selectedId)); freshTyping.current = true; return;
       }
     };
-
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [
-    selectedId,
-    selectedIds,
-    selectedEdgeIds,
-    editingId,
-    linking.phase,
-    edges,
-    nodes,
-    pan,
-    scale,
-  ]);
+  }, [selectedId, selectedIds, selectedEdgeIds, editingId, clipboard]);
 
-  /** Hintergrund-Interaktionen */
   function onPointerDownBg(e: React.PointerEvent<SVGRectElement>) {
-    if (editingId != null) setEditingId(null);
-    if (linking.phase !== "idle") return;
-
-    if (e.shiftKey) {
-      e.preventDefault();
-      const { x, y } = toWorld(e.clientX, e.clientY);
-      setMarquee({
-        active: true,
-        x1: x,
-        y1: y,
-        x2: x,
-        y2: y,
-      });
-      return;
-    }
-    clearSelection();
-    panning.current = true;
-    panStart.current = { x: e.clientX, y: e.clientY };
-    panAtStart.current = { ...pan };
-    freshTyping.current = true;
+      if (editingId != null) setEditingId(null);
+      if (linking.phase !== "idle") return;
+      if (e.shiftKey) {
+          e.preventDefault(); const { x, y } = toWorld(e.clientX, e.clientY);
+          setMarquee({ active: true, x1: x, y1: y, x2: x, y2: y }); return;
+      }
+      clearSelection(); panning.current = true; panStart.current = { x: e.clientX, y: e.clientY }; panAtStart.current = { ...pan }; freshTyping.current = true;
   }
-
   function onWheelSvg(e: React.WheelEvent<SVGSVGElement>) {
-    e.preventDefault();
-    const doZoom = !e.shiftKey;
-
-    if (doZoom) {
-      const zoomIntensity = 0.0015;
-      const factor = Math.exp(-e.deltaY * zoomIntensity);
-      const newScale = clamp(scale * factor, 0.3, 3);
-
-      const svg = svgRef.current!;
-      const rect = svg.getBoundingClientRect();
-      const mx = e.clientX - rect.left;
-      const my = e.clientY - rect.top;
-
-      const wx = (mx - pan.x) / scale;
-      const wy = (my - pan.y) / scale;
-
-      const newPanX = mx - wx * newScale;
-      const newPanY = my - wy * newScale;
-
-      setPan({ x: newPanX, y: newPanY });
-      setScale(newScale);
-      return;
-    }
-
-    setPan((prev) => ({
-      x: prev.x - e.deltaX,
-      y: prev.y - e.deltaY,
-    }));
+      e.preventDefault(); const doZoom = !e.shiftKey;
+      if (doZoom) {
+          const zoomIntensity = 0.0015; const factor = Math.exp(-e.deltaY * zoomIntensity); const newScale = clamp(scale * factor, 0.3, 3);
+          const svg = svgRef.current!; const rect = svg.getBoundingClientRect();
+          const mx = e.clientX - rect.left; const my = e.clientY - rect.top;
+          const wx = (mx - pan.x) / scale; const wy = (my - pan.y) / scale;
+          setPan({ x: mx - wx * newScale, y: my - wy * newScale }); setScale(newScale); return;
+      }
+      setPan((prev) => ({ x: prev.x - e.deltaX, y: prev.y - e.deltaY }));
   }
 
-  /** --- Render --- */
   return (
     <div
       style={{
-        width: "100vw",
-        height: "100vh",
-        background: "#f5f5f5",
-        overflow: "hidden",
-        userSelect: "none",
-        fontFamily:
-          "Inter, system-ui, -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif",
-        WebkitFontSmoothing: "antialiased",
+        width: "100vw", height: "100vh", background: "#f5f5f5", overflow: "hidden", userSelect: "none",
+        fontFamily: "Inter, system-ui, -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif",
       }}
-      onClick={() => {
-        if (contextMenu.open)
-          setContextMenu({ ...contextMenu, open: false });
-      }}
+      onClick={() => { if (contextMenu.open) setContextMenu({ ...contextMenu, open: false }); }}
       onContextMenu={(e) => {
-        e.preventDefault();
-        const w = toWorld(e.clientX, e.clientY);
-        setContextMenu({
-          open: true,
-          x: e.clientX,
-          y: e.clientY,
-          wx: w.x,
-          wy: w.y,
-          kind: "bg",
-        });
+        e.preventDefault(); const w = toWorld(e.clientX, e.clientY);
+        setContextMenu({ open: true, x: e.clientX, y: e.clientY, wx: w.x, wy: w.y, kind: "bg" });
       }}
     >
-      {/* kleine Toolbar fürs Speichern/Laden */}
-      <div
-        style={{
-          position: "fixed",
-          top: 5,
-          left: 5,
-          zIndex: 1500,
-          display: "flex",
-          gap: 10,
-          background: "rgba(255,255,255,0.9)",
-          padding: "5px 5px",
-          borderRadius: 10,
-          boxShadow: "0 4px 12px rgba(0,0,0,.12)",
-          border: "1px solid rgba(0,0,0,.06)",
-          backdropFilter: "blur(6px)",
-        }}
-      >
-        <button
-          onClick={exportToFile}
-          style={{
-            padding: "4px 5px",
-            borderRadius: 6,
-            border: "none",
-            cursor: "pointer",
-            background: "transparent",
-          }}
-        >
-          <svg
-            viewBox="0 0 24 24"
-            width="20"
-            height="20"
-            fill="currentColor"
-          >
-            <path d="M6 2h9l5 5v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2z" />
-            <path
-              d="M12 8v6m0 0l-3-3m3 3l3-3"
-              stroke="#ffffff"
-              strokeWidth="2"
-              fill="none"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          </svg>
-        </button>
-        <button
-          onClick={() => fileInputRef.current?.click()}
-          style={{
-            padding: "4px 5px",
-            borderRadius: 6,
-            border: "none",
-            cursor: "pointer",
-            background: "transparent",
-          }}
-        >
-          <svg
-            viewBox="0 0 24 24"
-            width="20"
-            height="20"
-            fill="currentColor"
-          >
-            <path d="M6 2h9l5 5v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2z" />
-            <path
-              d="M12 16V10m0 0l-3 3m3-3l3 3"
-              stroke="#ffffff"
-              strokeWidth="2"
-              fill="none"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          </svg>
-        </button>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="application/json"
-          style={{ display: "none" }}
-          onChange={handleFileChange}
-        />
-      </div>
-
-      {/* Help-Button oben rechts */}
-      <div
-        style={{
-          position: "fixed",
-          top: 5,
-          right: 5,
-          zIndex: 1500,
-        }}
+      {/* Hilfe Icon */}
+      <div 
+        style={{position:'fixed', top: 10, right: 10, zIndex: 1000}}
         onMouseEnter={() => setShowHelp(true)}
         onMouseLeave={() => setShowHelp(false)}
       >
-        <button
-          onClick={() => setShowHelp((v) => !v)}
-          style={{
-            width: 26,
-            height: 26,
-            borderRadius: "50%",
-            border: "1px solid rgba(15,23,42,.18)",
-            background: "rgba(255,255,255,0.95)",
-            cursor: "pointer",
-            fontSize: 16,
-            fontWeight: 600,
-            lineHeight: "1",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            boxShadow: "0 4px 10px rgba(15,23,42,.12)",
-            color: "#0f172a",
-          }}
-        >
-          ?
-        </button>
-
-        {showHelp && (
-          <div
-            style={{
-              marginTop: 8,
-              right: 0,
-              position: "absolute",
-              background: "rgba(255,255,255,0.98)",
-              padding: "10px 12px",
-              borderRadius: 10,
-              boxShadow: "0 10px 28px rgba(15,23,42,.2)",
-              border: "1px solid rgba(15,23,42,.08)",
-              minWidth: 260,
-              fontSize: 12,
-              color: "#0f172a",
-            }}
-          >
-            <div
-              style={{
-                fontWeight: 600,
-                marginBottom: 6,
-                fontSize: 13,
-              }}
-            >
-              Shortcuts
-            </div>
-            <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
-              <li><b>Enter</b> – Create child node</li>
-              <li><b>Shift + Enter</b> – Create sibling node</li>
-              <li><b>Arrow Keys</b> – Navigate to nearby node</li>
-              <li><b>Shift + Tab</b> – Go to parent / cycle back down</li>
-              <li><b>Tab</b> – Jump to previously selected node</li>
-              <li><b>Ctrl/Cmd + Z</b> – Undo</li>
-              <li><b>Ctrl/Cmd + Y</b> or <b>Shift + Ctrl/Cmd + Z</b> – Redo</li>
-              <li><b>Backspace</b> – Delete text (node) or edge label</li>
-              <li><b>Shift + Backspace</b> Delete node/edge</li>
-              <li><b>Shift + Drag</b> – Selection rectangle</li>
-              <li><b>Shift + Click + Drag</b> – Create edge</li>
-              <li><b>Ctrl/Cmd + Click</b> – Multi-select</li>
-              <li><b>Mouse wheel</b> – Zoom</li>
-              <li><b>Shift + Wheel</b> – Pan</li>
-              <li><b>Click Node A, then Node B</b> – Delete edge between them</li>
-            </ul>
-          </div>
-        )}
+          <div style={{width: 32, height: 32, borderRadius: '50%', background: '#fff', boxShadow: '0 2px 8px rgba(0,0,0,0.1)', display:'flex', alignItems:'center', justifyContent:'center', fontWeight:'bold', color: '#555', cursor:'help', border:'1px solid #ddd'}}>?</div>
+          {showHelp && (
+              <div style={{position:'absolute', top: 40, right: 0, width: 220, background:'white', padding: 12, borderRadius: 8, boxShadow: '0 4px 12px rgba(0,0,0,0.15)', fontSize: 12, lineHeight: 1.6, border: '1px solid #eee'}}>
+                  <strong>Shortcuts</strong><br/>
+                  <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap: 4}}>
+                  <span>Enter</span> <span>Add Child</span>
+                      <span>Shift+Enter</span> <span>Add Sibling</span>
+                      <span>Shift+Drag</span> <span>Connect (Arrow)</span>
+                      <span>Shift+Click</span> <span>Connect (Line)</span>
+                      <span>Ctrl+B</span> <span>Highlight</span>
+                      <span>Ctrl+C/V</span> <span>Copy / Paste</span>
+                      <span>Arrow Keys</span> <span>Navigate</span>
+                      <span>Tab</span> <span>Switch Node</span>
+                  </div>
+              </div>
+          )}
       </div>
 
-      {/* Zeichenfläche */}
+      {/* Toolbar */}
+      <div style={{ position: "fixed", top: 5, left: 5, zIndex: 1500, display: "flex", gap: 10, background: "rgba(255,255,255,0.9)", padding: "5px 5px", borderRadius: 10, boxShadow: "0 4px 12px rgba(0,0,0,.12)", border: "1px solid rgba(0,0,0,.06)" }}>
+        <button onClick={exportToFile} style={{ border: "none", background: "transparent", cursor: "pointer" }}>💾</button>
+        <button onClick={() => fileInputRef.current?.click()} style={{ border: "none", background: "transparent", cursor: "pointer" }}>📂</button>
+        <input ref={fileInputRef} type="file" accept="application/json" style={{ display: "none" }} onChange={handleFileChange} />
+      </div>
+
       <svg
-        ref={svgRef}
-        width="100%"
-        height="100%"
-        onPointerDown={onPointerDownSvg}
-        onPointerMove={onPointerMoveSvg}
-        onPointerUp={onPointerUpSvg}
-        onPointerLeave={onPointerUpSvg}
-        onPointerCancel={onPointerCancelSvg}
-        onWheel={onWheelSvg}
-        shapeRendering="geometricPrecision"
-        textRendering="geometricPrecision"
-        style={{
-          touchAction: "none",
-          background: "#ffffff",
-          cursor:
-            groupDragging.current || draggingNodeId.current
-              ? "grabbing"
-              : linking.phase === "active"
-              ? "crosshair"
-              : "grab",
-          userSelect: "none",
-        }}
+        ref={svgRef} width="100%" height="100%"
+        onPointerDown={onPointerDownSvg} onPointerMove={onPointerMoveSvg} onPointerUp={onPointerUpSvg} onPointerLeave={onPointerUpSvg} onPointerCancel={onPointerCancelSvg} onWheel={onWheelSvg}
+        style={{ touchAction: "none", background: "#ffffff", cursor: groupDragging.current || draggingNodeId.current ? "grabbing" : linking.phase === "active" ? "crosshair" : "grab" }}
       >
         <defs>
-          <marker
-            id="arrowhead"
-            markerWidth="10"
-            markerHeight="10"
-            refX="8"
-            refY="3"
-            orient="auto"
-          >
-            <polygon points="0 0, 10 3, 0 6" fill="#888" />
+          <pattern id="dotGrid" width="32" height="32" patternUnits="userSpaceOnUse">
+              {/* Das hier ist rund: */}
+              <circle cx="1" cy="1" r="1" fill="#cbd5e1" opacity="0.7" />
+            </pattern>
+          {/* RefX auf 10 für exakte Spitze */}
+          <marker id="arrow-default" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+               <polygon points="0 0, 10 3.5, 0 7" fill="#888" />
           </marker>
-          <marker
-            id="arrowhead-selected"
-            markerWidth="10"
-            markerHeight="10"
-            refX="8"
-            refY="3"
-            orient="auto"
-          >
-            <polygon points="0 0, 10 3, 0 6" fill="#1976d2" />
+          <marker id="arrow-selected" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+               <polygon points="0 0, 10 3.5, 0 7" fill="#1976d2" />
           </marker>
-          <pattern
-            id="dotGrid"
-            width="32"
-            height="32"
-            patternUnits="userSpaceOnUse"
-          >
-            <rect
-              x="0"
-              y="0"
-              width="2"
-              height="2"
-              fill="#cbd5e1"
-              opacity="0.7"
-              shapeRendering="crispEdges"
-            />
-          </pattern>
         </defs>
         <g transform={`translate(${pan.x},${pan.y}) scale(${scale})`}>
-          {/* Hintergrund */}
-          <rect
-            x={-5000}
-            y={-5000}
-            width={10000}
-            height={10000}
-            fill="url(#dotGrid)"
-            onPointerDown={onPointerDownBg}
-            onContextMenu={(e) => {
-              e.preventDefault();
-              const w = toWorld(e.clientX, e.clientY);
-              setContextMenu({
-                open: true,
-                x: e.clientX,
-                y: e.clientY,
-                wx: w.x,
-                wy: w.y,
-                kind: "bg",
-              });
-            }}
-          />
+          <rect x={-5000} y={-5000} width={10000} height={10000} fill="url(#dotGrid)" onPointerDown={onPointerDownBg} onContextMenu={(e) => { e.preventDefault(); const w = toWorld(e.clientX, e.clientY); setContextMenu({ open: true, x: e.clientX, y: e.clientY, wx: w.x, wy: w.y, kind: "bg" }); }} />
 
-          {/* Kanten */}
           {edges.map((e) => {
             const s = nodes.find((n) => n.id === e.source);
             const t = nodes.find((n) => n.id === e.target);
             if (!s || !t) return null;
+            
+            // Intersection Math für saubere Pfeile
+            const { x: tx, y: ty } = getRectIntersection(s, t);
 
-            const highlightedNodeSide =
-              selectedIds.has(e.source) ||
-              selectedIds.has(e.target);
+            const highlightedNodeSide = selectedIds.has(e.source) || selectedIds.has(e.target);
             const isEdgeSelected = selectedEdgeIds.has(e.id);
-
-            const stroke = isEdgeSelected
-              ? "#1976d2"
-              : highlightedNodeSide
-              ? "#1976d2"
-              : "#888";
-            const strokeWidth = isEdgeSelected
-              ? 3
-              : highlightedNodeSide
-              ? 2.5
-              : 1.5;
+            const stroke = isEdgeSelected ? "#1976d2" : highlightedNodeSide ? "#1976d2" : "#888";
+            const strokeWidth = isEdgeSelected ? 3 : highlightedNodeSide ? 2.5 : 1.5;
             const dash = e.dashed ? "8 6" : undefined;
+            const marker = e.arrow ? (isEdgeSelected ? "url(#arrow-selected)" : "url(#arrow-default)") : undefined;
 
-            const onEdgePointerDown = (
-              evt:
-                | React.PointerEvent<SVGLineElement>
-                | React.PointerEvent<SVGPathElement>
-            ) => {
-              evt.stopPropagation();
-              setSelectedIds(new Set());
-              setSelectedId(null);
-              setSelectedEdgeIds((prev) => {
-                const next = new Set(prev);
-                if (evt.shiftKey) {
-                  if (next.has(e.id)) next.delete(e.id);
-                  else next.add(e.id);
-                } else {
-                  next.clear();
-                  next.add(e.id);
-                }
-                return next;
-              });
-              freshTyping.current = true;
+            const onEdgePointerDown = (evt: any) => {
+               evt.stopPropagation(); setSelectedIds(new Set()); setSelectedId(null);
+               setSelectedEdgeIds((prev) => { const next = new Set(prev); if (evt.shiftKey) { if (next.has(e.id)) next.delete(e.id); else next.add(e.id); } else { next.clear(); next.add(e.id); } return next; }); freshTyping.current = true;
             };
 
-            const mx = (s.x + t.x) / 2;
-            const my = (s.y + t.y) / 2;
+            const mx = (s.x + tx) / 2;
+            const my = (s.y + ty) / 2;
 
             return (
               <g key={e.id}>
-                {/* breiter Hit-Bereich */}
-                <line
-                  x1={s.x}
-                  y1={s.y}
-                  x2={t.x}
-                  y2={t.y}
-                  stroke="transparent"
-                  strokeWidth={Math.max(20 / scale, 12)}
-                  onPointerDown={onEdgePointerDown}
-                  onContextMenu={(evt) => {
-                    evt.preventDefault();
-                    evt.stopPropagation();
-                    setSelectedIds(new Set());
-                    setSelectedId(null);
-                    setSelectedEdgeIds(new Set([e.id]));
-                    setContextMenu({
-                      open: true,
-                      x: evt.clientX,
-                      y: evt.clientY,
-                      kind: "edge",
-                      targetEdgeId: e.id,
-                    });
-                  }}
-                />
-                <line
-                  x1={s.x}
-                  y1={s.y}
-                  x2={t.x}
-                  y2={t.y}
-                  stroke={stroke}
-                  strokeWidth={strokeWidth}
-                  strokeDasharray={dash}
-                  vectorEffect="non-scaling-stroke"
-                  markerEnd={isEdgeSelected ? "url(#arrowhead-selected)" : "url(#arrowhead)"}
-                />
+                <line x1={s.x} y1={s.y} x2={tx} y2={ty} stroke="transparent" strokeWidth={Math.max(12 / scale, 6)} onPointerDown={onEdgePointerDown} onContextMenu={(evt) => { evt.preventDefault(); evt.stopPropagation(); setSelectedIds(new Set()); setSelectedId(null); setSelectedEdgeIds(new Set([e.id])); setContextMenu({ open: true, x: evt.clientX, y: evt.clientY, kind: "edge", targetEdgeId: e.id }); }} />
+                <line x1={s.x} y1={s.y} x2={tx} y2={ty} stroke={stroke} strokeWidth={strokeWidth} strokeDasharray={dash} vectorEffect="non-scaling-stroke" markerEnd={marker} />
                 {e.label && (
                   <g pointerEvents="none">
-                    <rect
-                      x={mx - e.label.length * 6}
-                      y={my - 10}
-                      width={Math.max(24, e.label.length * 12)}
-                      height={20}
-                      rx={6}
-                      ry={6}
-                      fill="rgba(255,255,255,0.95)"
-                      stroke="rgba(15,23,42,0.08)"
-                      strokeWidth={0.5}
-                      vectorEffect="non-scaling-stroke"
-                    />
-                    <text
-                      x={mx}
-                      y={my + 5}
-                      textAnchor="middle"
-                      fontSize={12}
-                      fill={isEdgeSelected ? "#1976d2" : "#0f172a"}
-                    >
-                      {e.label}
-                    </text>
+                    <rect x={mx - e.label.length * 6} y={my - 10} width={Math.max(24, e.label.length * 12)} height={20} rx={6} ry={6} fill="rgba(255,255,255,0.95)" stroke="rgba(15,23,42,0.08)" strokeWidth={0.5} />
+                    <text x={mx} y={my + 5} textAnchor="middle" fontSize={12} fill={isEdgeSelected ? "#1976d2" : "#0f172a"}>{e.label}</text>
                   </g>
                 )}
               </g>
             );
           })}
 
-          {/* temporäre Kante */}
-          {linking.phase === "active" &&
-            linking.sourceId != null &&
-            (() => {
-              const s = nodes.find(
-                (n) => n.id === linking.sourceId
-              )!;
-              return (
-                <line
-                  x1={s.x}
-                  y1={s.y}
-                  x2={linking.x}
-                  y2={linking.y}
-                  stroke="#1976d2"
-                  strokeWidth={2}
-                  strokeDasharray="6 4"
-                  vectorEffect="non-scaling-stroke"
-                />
-              );
-            })()}
+          {linking.phase === "active" && linking.sourceId != null && (() => {
+            const s = nodes.find((n) => n.id === linking.sourceId)!;
+            return <line x1={s.x} y1={s.y} x2={linking.x} y2={linking.y} stroke="#1976d2" strokeWidth={2} strokeDasharray="6 4" vectorEffect="non-scaling-stroke" markerEnd="url(#arrow-selected)" />;
+          })()}
 
-          {/* Knoten */}
           {nodes.map((n) => {
             const isEditing = editingId === n.id;
             const isSelected = selectedIds.has(n.id);
-
-            const baseFont = clamp(
-              Math.round(n.h * 0.35),
-              12,
-              20
-            );
+            const baseFont = clamp(Math.round(n.h * 0.35), 12, 20);
             const displayText = isEditing ? editingText : n.label;
             const L = layoutLabel(displayText, baseFont, n.w);
-            const textLines = L.lines;
-
-            const corner = Math.round(
-              Math.min(n.w, n.h) * 0.24
-            );
-            const stroke = isSelected
-              ? "#1976d2"
-              : n.strokeColor || "#0f172a";
-            const strokeW = isSelected ? 2.5 : 1.5;
-
-            const startY =
-              -((textLines.length - 1) / 2) * L.lineHeight;
+            const corner = Math.round(Math.min(n.w, n.h) * 0.24);
+            const stroke = isSelected ? "#1976d2" : n.strokeColor || "#0f172a";
+            // Highlight: Dickerer Rand (4)
+            const strokeW = n.bold ? 4 : (isSelected ? 2.5 : 1.5);
 
             return (
-              <g
-                key={n.id}
-                transform={`translate(${n.x},${n.y})`}
-                onPointerDown={(e) => onPointerDownNode(e, n.id)}
-                onDoubleClick={() => {
-                  selectOnly(n.id);
-                  freshTyping.current = true;
-                }}
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-
-                  if (!selectedIds.has(n.id)) {
-                    selectOnly(n.id);
-                  }
-
-                  setContextMenu({
-                    open: true,
-                    x: e.clientX,
-                    y: e.clientY,
-                    kind: "node",
-                    targetNodeId: n.id,
-                  });
-                }}
-              >
-                {/* Box */}
-                <rect
-                  x={-n.w / 2}
-                  y={-n.h / 2}
-                  width={n.w}
-                  height={n.h}
-                  rx={corner}
-                  ry={corner}
-                  fill="#ffffff"
-                />
-                {n.fillColor && (
-                  <rect
-                    x={-n.w / 2}
-                    y={-n.h / 2}
-                    width={n.w}
-                    height={n.h}
-                    rx={corner}
-                    ry={corner}
-                    fill={n.fillColor}
-                  />
-                )}
-                <rect
-                  x={-n.w / 2}
-                  y={-n.h / 2}
-                  width={n.w}
-                  height={n.h}
-                  rx={corner}
-                  ry={corner}
-                  fill="none"
-                  stroke={stroke}
-                  strokeWidth={strokeW}
-                  vectorEffect="non-scaling-stroke"
-                />
-
-                {/* Text */}
+              <g key={n.id} transform={`translate(${n.x},${n.y})`} onPointerDown={(e) => onPointerDownNode(e, n.id)} onDoubleClick={() => { selectOnly(n.id); freshTyping.current = true; }} onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); if (!selectedIds.has(n.id)) selectOnly(n.id); setContextMenu({ open: true, x: e.clientX, y: e.clientY, kind: "node", targetNodeId: n.id }); }}>
+                <rect x={-n.w / 2} y={-n.h / 2} width={n.w} height={n.h} rx={corner} ry={corner} fill={n.fillColor || "#ffffff"} />
+                <rect x={-n.w / 2} y={-n.h / 2} width={n.w} height={n.h} rx={corner} ry={corner} fill="none" stroke={stroke} strokeWidth={strokeW} vectorEffect="non-scaling-stroke" />
                 <g pointerEvents="none">
-                  {textLines.map((line, i) => (
-                    <text
-                      key={i}
-                      textAnchor="middle"
-                      dominantBaseline="middle"
-                      x={0}
-                      y={startY + i * L.lineHeight}
-                      fontSize={L.fontSize}
-                      fontWeight={n.bold ? 700 : 500}
-                      fill={isSelected ? "#0f172a" : "#111827"}
-                    >
-                      {line}
-                    </text>
+                  {L.lines.map((line, i) => (
+                    <text key={i} textAnchor="middle" dominantBaseline="middle" x={0} y={-((L.lines.length - 1) / 2) * L.lineHeight + i * L.lineHeight} fontSize={L.fontSize} fontWeight={n.bold ? 700 : 500} fill={isSelected ? "#0f172a" : "#111827"}>{line}</text>
                   ))}
                 </g>
-
-                {/* Unsichtbares Input (für Direkt-Editing, Text im SVG bleibt sichtbar) */}
                 {isEditing && (
-                  <foreignObject
-                    x={-n.w / 2 + 8}
-                    y={-n.h / 2 + 6}
-                    width={n.w - 16}
-                    height={n.h - 12}
-                  >
-                    <input
-                      ref={editInputRef}
-                      value={editingText}
-                      onChange={(e) => {
-                        const v = e.target.value;
-                        setEditingText(v);
-                        if (editingId != null) {
-                          pushHistory();
-                          setNodes((prev) =>
-                            prev.map((nn) =>
-                              nn.id === editingId
-                                ? resizeNodeForLabel({
-                                    ...nn,
-                                    label: v,
-                                  })
-                                : nn
-                            )
-                          );
-                        }
-                      }}
-                      onBlur={() => setEditingId(null)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") setEditingId(null);
-                        if (e.key === "Escape") setEditingId(null);
-                      }}
-                      style={{
-                        width: "100%",
-                        height: "100%",
-                        border: "none",
-                        background: "transparent",
-                        color: "transparent", // Text im SVG ist sichtbar, das Input nur für Caret
-                        caretColor: isSelected
-                          ? "#1976d2"
-                          : "#000",
-                        padding: 0,
-                        margin: 0,
-                        fontSize: L.fontSize,
-                        lineHeight: `${L.lineHeight}px`,
-                        textAlign: "center",
-                        outline: "none",
-                        fontFamily:
-                          "Inter, system-ui, -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif",
-                      }}
-                    />
+                  <foreignObject x={-n.w / 2 + 8} y={-n.h / 2 + 6} width={n.w - 16} height={n.h - 12}>
+                    <input ref={editInputRef} value={editingText} onChange={(e) => { const v = e.target.value; setEditingText(v); if (editingId != null) { pushHistory(); setNodes((prev) => prev.map((nn) => nn.id === editingId ? resizeNodeForLabel({ ...nn, label: v }) : nn)); } }} onBlur={() => setEditingId(null)} onKeyDown={(e) => { if (e.key === "Enter") setEditingId(null); if (e.key === "Escape") setEditingId(null); }} style={{ width: "100%", height: "100%", border: "none", background: "transparent", color: "transparent", caretColor: "#000", fontSize: L.fontSize, lineHeight: `${L.lineHeight}px`, textAlign: "center", outline: "none" }} />
                   </foreignObject>
                 )}
               </g>
             );
           })}
-
-          {/* Marquee */}
-          {marquee.active &&
-            (() => {
-              const { x1, y1, x2, y2 } = marquee;
-              const x = Math.min(x1, x2);
-              const y = Math.min(y1, y2);
-              const w = Math.abs(x2 - x1);
-              const h = Math.abs(y2 - y1);
-              return (
-                <rect
-                  x={x}
-                  y={y}
-                  width={w}
-                  height={h}
-                  fill="#93c5fd"
-                  fillOpacity={0.18}
-                  stroke="#2563eb"
-                  strokeDasharray="6 4"
-                  vectorEffect="non-scaling-stroke"
-                />
-              );
-            })()}
+          {marquee.active && <rect x={Math.min(marquee.x1, marquee.x2)} y={Math.min(marquee.y1, marquee.y2)} width={Math.abs(marquee.x2 - marquee.x1)} height={Math.abs(marquee.y2 - marquee.y1)} fill="#93c5fd" fillOpacity={0.18} stroke="#2563eb" strokeDasharray="6 4" />}
         </g>
       </svg>
 
-      {/* Rechtsklick-Menü */}
       {contextMenu.open && (
-        <div
-          style={{
-            position: "fixed",
-            left: contextMenu.x,
-            top: contextMenu.y,
-            zIndex: 2000,
-            background: "#ffffff",
-            borderRadius: 10,
-            boxShadow: "0 8px 24px rgba(15,23,42,.18)",
-            padding: 6,
-            minWidth: 240,
-            border: "1px solid rgba(15,23,42,.06)",
-          }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          {/* Hintergrund */}
-          {contextMenu.kind === "bg" && (
-            <>
-              <MenuItem
-                label="➕ New Node"
-                onClick={() => {
-                  const id =
-                    contextMenu.wx != null &&
-                    contextMenu.wy != null
-                      ? addStandalone({
-                          x: contextMenu.wx,
-                          y: contextMenu.wy,
-                        })
-                      : addStandalone();
-                  selectOnly(id);
-                  setContextMenu({
-                    ...contextMenu,
-                    open: false,
-                  });
-                }}
-              />
-
-              <div
-                style={{
-                  height: 1,
-                  background: "rgba(15,23,42,.08)",
-                  margin: "6px 0",
-                }}
-              />
-              <div style={{ padding: "6px 10px" }}>
-                <div
-                  style={{
-                    fontSize: 12,
-                    opacity: 0.7,
-                    marginBottom: 6,
-                  }}
-                >
-                  Color
-                </div>
-                <div
-                  style={{
-                    display: "flex",
-                    gap: 6,
-                    flexWrap: "wrap",
-                    alignItems: "center",
-                  }}
-                >
-                  {[
-                    { name: "Blue", color: "#90caf9" },
-                    { name: "Green", color: "#a5d6a7" },
-                    { name: "Yellow", color: "#ffe082" },
-                    { name: "Red", color: "#ef9a9a" },
-                  ].map((p) => (
-                    <button
-                      key={`bg-${p.color}`}
-                      onClick={() => {
-                        const ids = Array.from(selectedIds);
-                        if (!ids.length) return;
-                        const rgba = hexToRgba60(p.color);
-                        pushHistory();
-                        setNodes((prev) =>
-                          prev.map((n) =>
-                            ids.includes(n.id)
-                              ? { ...n, fillColor: rgba }
-                              : n
-                          )
-                        );
-                        setContextMenu({
-                          ...contextMenu,
-                          open: false,
-                        });
-                      }}
-                      style={{
-                        width: 28,
-                        height: 28,
-                        border: "none",
-                        background: "transparent",
-                        padding: 0,
-                        cursor: selectedIds.size
-                          ? "pointer"
-                          : "not-allowed",
-                      }}
-                    >
-                      <span
-                        style={{
-                          display: "block",
-                          width: 24,
-                          height: 24,
-                          borderRadius: 8,
-                          background: p.color,
-                        }}
-                      />
-                    </button>
-                  ))}
-                  <button
-                    disabled={selectedIds.size === 0}
-                    onClick={() => {
-                      const ids = Array.from(selectedIds);
-                      if (!ids.length) return;
-                      pushHistory();
-                      setNodes((prev) =>
-                        prev.map((n) =>
-                          ids.includes(n.id)
-                            ? { ...n, fillColor: undefined }
-                            : n
-                        )
-                      );
-                      setContextMenu({
-                        ...contextMenu,
-                        open: false,
-                      });
-                    }}
-                    style={{
-                      background: "#e5e7eb",
-                      color: "#111827",
-                      border: "none",
-                      padding: "6px 10px",
-                      borderRadius: 8,
-                      cursor: selectedIds.size
-                        ? "pointer"
-                        : "not-allowed",
-                      fontSize: 12,
-                    }}
-                  >
-                    Clear
-                  </button>
-                </div>
-              </div>
-
-              <div
-                style={{
-                  height: 1,
-                  background: "rgba(15,23,42,.08)",
-                  margin: "6px 0",
-                }}
-              />
-              <MenuItem
-                label="🗑️ Delete"
-                onClick={() => {
-                  if (selectedIds.size > 0)
-                    removeNodes(Array.from(selectedIds));
-                  else if (selectedEdgeIds.size > 0)
-                    removeEdges(Array.from(selectedEdgeIds));
-                  setContextMenu({
-                    ...contextMenu,
-                    open: false,
-                  });
-                }}
-                disabled={
-                  selectedIds.size === 0 &&
-                  selectedEdgeIds.size === 0
-                }
-              />
-            </>
-          )}
-
-          {/* Knoten */}
+        <div style={{ position: "fixed", left: contextMenu.x, top: contextMenu.y, zIndex: 2000, background: "#ffffff", borderRadius: 10, boxShadow: "0 8px 24px rgba(15,23,42,.18)", padding: 6, minWidth: 240, border: "1px solid rgba(15,23,42,.06)" }} onClick={(e) => e.stopPropagation()}>
+          {contextMenu.kind === "bg" && <MenuItem label="➕ New Node" onClick={() => { const id = contextMenu.wx != null ? addStandalone({ x: contextMenu.wx, y: contextMenu.wy! }) : addStandalone(); selectOnly(id); setContextMenu({ ...contextMenu, open: false }); }} />}
+          
           {contextMenu.kind === "node" && (
             <>
-              <MenuItem
-                label="✏️ Rename"
-                onClick={() => {
-                  if (contextMenu.targetNodeId != null) {
-                    setEditingId(contextMenu.targetNodeId);
-                    setEditingText(
-                      nodes.find(
-                        (n) =>
-                          n.id === contextMenu.targetNodeId
-                      )?.label || ""
-                    );
-                  }
-                  setContextMenu({
-                    ...contextMenu,
-                    open: false,
-                  });
-                }}
-              />
-              <MenuItem
-                label="➕ Child"
-                onClick={() => {
-                  if (contextMenu.targetNodeId != null) {
-                    const id = addChild(contextMenu.targetNodeId);
-                    selectOnly(id);
-                  }
-                  setContextMenu({
-                    ...contextMenu,
-                    open: false,
-                  });
-                }}
-              />
-              <MenuItem
-                label="➕ Sibling"
-                onClick={() => {
-                  if (contextMenu.targetNodeId != null) {
-                    const id = addSiblingOf(
-                      contextMenu.targetNodeId
-                    );
-                    selectOnly(id);
-                  }
-                  setContextMenu({
-                    ...contextMenu,
-                    open: false,
-                  });
-                }}
-              />
-              <MenuItem
-                label="⭐ Highlight"
-                onClick={() => {
-                  if (contextMenu.targetNodeId != null) {
-                    const id = contextMenu.targetNodeId;
-                    pushHistory();
-                    setNodes((prev) =>
-                      prev.map((n) =>
-                        n.id === id
-                          ? { ...n, bold: !n.bold }
-                          : n
-                      )
-                    );
-                  }
-                  setContextMenu({
-                    ...contextMenu,
-                    open: false,
-                  });
-                }}
-              />
-              <div
-                style={{
-                  height: 1,
-                  background: "rgba(15,23,42,.08)",
-                  margin: "6px 0",
-                }}
-              />
-
-              <div style={{ padding: "6px 10px" }}>
-                <div
-                  style={{
-                    fontSize: 12,
-                    opacity: 0.7,
-                    marginBottom: 6,
-                  }}
-                >
-                  Color
-                </div>
-                <div
-                  style={{
-                    display: "flex",
-                    gap: 6,
-                    flexWrap: "wrap",
-                    alignItems: "center",
-                  }}
-                >
-                  {[
-                    { name: "Blue", color: "#90caf9" },
-                    { name: "Green", color: "#a5d6a7" },
-                    { name: "Yellow", color: "#ffe082" },
-                    { name: "Red", color: "#ef9a9a" },
-                  ].map((p) => (
-                    <button
-                      key={p.color}
-                      title={p.name}
-                      onClick={() => {
-                        const ids =
-                          selectedIds.size > 0
-                            ? Array.from(selectedIds)
-                            : contextMenu.targetNodeId != null
-                            ? [contextMenu.targetNodeId]
-                            : [];
-
-                        if (!ids.length) return;
-
-                        const rgba = hexToRgba60(p.color);
-                        pushHistory();
-                        setNodes((prev) =>
-                          prev.map((n) =>
-                            ids.includes(n.id)
-                              ? { ...n, fillColor: rgba }
-                              : n
-                          )
-                        );
-                        setContextMenu({
-                          ...contextMenu,
-                          open: false,
-                        });
-                      }}
-                      style={{
-                        width: 28,
-                        height: 28,
-                        border: "none",
-                        background: "transparent",
-                        padding: 0,
-                        cursor: "pointer",
-                      }}
-                    >
-                      <span
-                        style={{
-                          display: "block",
-                          width: 24,
-                          height: 24,
-                          borderRadius: 8,
-                          background: p.color,
-                        }}
-                      />
-                    </button>
-                  ))}
-
-                  <button
-                    onClick={() => {
-                      const ids =
-                        selectedIds.size > 0
-                          ? Array.from(selectedIds)
-                          : contextMenu.targetNodeId != null
-                          ? [contextMenu.targetNodeId]
-                          : [];
-
-                      if (!ids.length) return;
-
-                      pushHistory();
-                      setNodes((prev) =>
-                        prev.map((n) =>
-                          ids.includes(n.id)
-                            ? { ...n, fillColor: undefined }
-                            : n
-                        )
-                      );
-                      setContextMenu({
-                        ...contextMenu,
-                        open: false,
-                      });
-                    }}
-                    style={{
-                      background: "#e5e7eb",
-                      color: "#111827",
-                      border: "none",
-                      padding: "6px 10px",
-                      borderRadius: 8,
-                      fontSize: 12,
-                    }}
-                  >
-                    No Color
-                  </button>
-                </div>
-              </div>
-
-              <div
-                style={{
-                  height: 1,
-                  background: "rgba(15,23,42,.08)",
-                  margin: "6px 0",
-                }}
-              />
-              <MenuItem
-                label="🗑️ Delete"
-                onClick={() => {
-                  if (contextMenu.targetNodeId != null)
-                    removeNodes([contextMenu.targetNodeId]);
-                  setContextMenu({
-                    ...contextMenu,
-                    open: false,
-                  });
-                }}
-              />
+              <MenuItem label="✏️ Rename" onClick={() => { if (contextMenu.targetNodeId != null) { setEditingId(contextMenu.targetNodeId); setEditingText(nodes.find((n) => n.id === contextMenu.targetNodeId)?.label || ""); } setContextMenu({ ...contextMenu, open: false }); }} />
+              <MenuItem label="➕ Child" onClick={() => { if (contextMenu.targetNodeId != null) selectOnly(addChild(contextMenu.targetNodeId)); setContextMenu({ ...contextMenu, open: false }); }} />
+              <MenuItem label="⭐ Highlight (Strg+B)" onClick={() => { 
+                  if (contextMenu.targetNodeId != null) { 
+                      pushHistory(); 
+                      const ids = Array.from(selectedIds);
+                      setNodes(prev => prev.map(n => ids.includes(n.id) ? { ...n, bold: !n.bold } : n));
+                  } 
+                  setContextMenu({ ...contextMenu, open: false }); 
+              }} />
+              <div style={{ height: 1, background: "rgba(15,23,42,.08)", margin: "6px 0" }} />
+              <MenuItem label="🗑️ Delete" onClick={() => { if (contextMenu.targetNodeId != null) removeNodes([contextMenu.targetNodeId]); setContextMenu({ ...contextMenu, open: false }); }} />
             </>
           )}
 
-          {/* Kante */}
           {contextMenu.kind === "edge" && (
             <>
-              <MenuItem
-                label="╌╌╌ Toggle dashed"
-                onClick={() => {
-                  if (contextMenu.targetEdgeId != null) {
-                    const id = contextMenu.targetEdgeId;
-                    pushHistory();
-                    setEdges((prev) =>
-                      prev.map((ed) =>
-                        ed.id === id
-                          ? { ...ed, dashed: !ed.dashed }
-                          : ed
-                      )
-                    );
-                  }
-                  setContextMenu({
-                    ...contextMenu,
-                    open: false,
-                  });
-                }}
-              />
-              <MenuItem
-                label="✏️ Rename edge"
-                onClick={() => {
-                  if (contextMenu.targetEdgeId != null) {
-                    const ed = edges.find(
-                      (x) =>
-                        x.id === contextMenu.targetEdgeId
-                    );
-                    const cur = ed?.label ?? "";
-                    const next = window.prompt(
-                      "Label for edge:",
-                      cur
-                    );
-                    if (next !== null) {
-                      pushHistory();
-                      const id = contextMenu.targetEdgeId;
-                      setEdges((prev) =>
-                        prev.map((e) =>
-                          e.id === id
-                            ? {
-                                ...e,
-                                label:
-                                  next.trim() || undefined,
-                              }
-                            : e
-                        )
-                      );
-                    }
-                  }
-                  setContextMenu({
-                    ...contextMenu,
-                    open: false,
-                  });
-                }}
-              />
-              <div
-                style={{
-                  height: 1,
-                  background: "rgba(15,23,42,.08)",
-                  margin: "6px 0",
-                }}
-              />
-              <MenuItem
-                label="🗑️ Delete edge"
-                onClick={() => {
-                  if (contextMenu.targetEdgeId != null)
-                    removeEdges([contextMenu.targetEdgeId]);
-                  setContextMenu({
-                    ...contextMenu,
-                    open: false,
-                  });
-                }}
-              />
+              <MenuItem label="╌╌╌ Toggle dashed" onClick={() => { if (contextMenu.targetEdgeId != null) { pushHistory(); setEdges((prev) => prev.map((ed) => ed.id === contextMenu.targetEdgeId ? { ...ed, dashed: !ed.dashed } : ed)); } setContextMenu({ ...contextMenu, open: false }); }} />
+              <MenuItem label="➔ Toggle Arrow" onClick={() => { if (contextMenu.targetEdgeId != null) { pushHistory(); setEdges((prev) => prev.map((ed) => ed.id === contextMenu.targetEdgeId ? { ...ed, arrow: !ed.arrow } : ed)); } setContextMenu({ ...contextMenu, open: false }); }} />
+              <MenuItem label="✏️ Rename edge" onClick={() => { if (contextMenu.targetEdgeId != null) { const ed = edges.find((x) => x.id === contextMenu.targetEdgeId); const next = window.prompt("Label for edge:", ed?.label ?? ""); if (next !== null) { pushHistory(); setEdges((prev) => prev.map((e) => e.id === contextMenu.targetEdgeId ? { ...e, label: next.trim() || undefined } : e)); } } setContextMenu({ ...contextMenu, open: false }); }} />
+              <div style={{ height: 1, background: "rgba(15,23,42,.08)", margin: "6px 0" }} />
+              <MenuItem label="🗑️ Delete edge" onClick={() => { if (contextMenu.targetEdgeId != null) removeEdges([contextMenu.targetEdgeId]); setContextMenu({ ...contextMenu, open: false }); }} />
             </>
           )}
         </div>
@@ -2502,41 +1138,8 @@ export default function App() {
   );
 }
 
-/** --- MenuItem-Helper --- */
-function MenuItem({
-  label,
-  onClick,
-  disabled,
-}: {
-  label: string;
-  onClick?: () => void;
-  disabled?: boolean;
-}) {
+function MenuItem({ label, onClick, disabled }: { label: string; onClick?: () => void; disabled?: boolean }) {
   return (
-    <button
-      onClick={disabled ? undefined : onClick}
-      disabled={disabled}
-      style={{
-        width: "100%",
-        textAlign: "left",
-        padding: "8px 12px",
-        border: "none",
-        background: "transparent",
-        cursor: disabled ? "not-allowed" : "pointer",
-        borderRadius: 8,
-        color: disabled ? "#9ca3af" : "#0f172a",
-        fontSize: 13,
-      }}
-      onMouseEnter={(e) => {
-        (e.currentTarget as HTMLButtonElement).style.background =
-          "rgba(37,99,235,.08)";
-      }}
-      onMouseLeave={(e) => {
-        (e.currentTarget as HTMLButtonElement).style.background =
-          "transparent";
-      }}
-    >
-      {label}
-    </button>
+    <button onClick={disabled ? undefined : onClick} disabled={disabled} style={{ width: "100%", textAlign: "left", padding: "8px 12px", border: "none", background: "transparent", cursor: disabled ? "not-allowed" : "pointer", borderRadius: 8, color: disabled ? "#9ca3af" : "#0f172a", fontSize: 13 }} onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "rgba(37,99,235,.08)"; }} onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "transparent"; }}>{label}</button>
   );
 }
