@@ -258,6 +258,8 @@ export default function App() {
     targetEdgeId?: number;
   }>({ open: false, x: 0, y: 0, kind: "bg" });
 
+  const [showHelp, setShowHelp] = useState(false);
+
   // File-Input-Ref für Load-Dialog
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -349,11 +351,9 @@ export default function App() {
     return { cx, cy, d };
   }
   function selectOnly(id: number) {
-    // Shift+Tab-Pfad zurücksetzen, wenn Auswahl wechselt
     shiftTabPathRef.current = null;
     shiftTabIndexRef.current = 0;
 
-    // vorher markierten Knoten merken, wenn tatsächlich gewechselt wird
     if (selectedId != null && selectedId !== id) {
       prevSelectedIdRef.current = selectedId;
     }
@@ -394,16 +394,6 @@ export default function App() {
       if (d < Math.max(BASE_W, BASE_H) / 2 + EDGE_PADDING) return false;
     }
     return true;
-  }
-  function ensureEdge(a: number, b: number) {
-    if (a === b) return;
-    const exists = edges.some(
-      (ed) =>
-        (ed.source === a && ed.target === b) ||
-        (ed.source === b && ed.target === a)
-    );
-    if (!exists)
-      setEdges((es) => [...es, { id: Date.now(), source: a, target: b }]);
   }
   function getParentId(childId: number): number | null {
     const e = edges.find((ed) => ed.target === childId);
@@ -715,13 +705,32 @@ export default function App() {
   ) {
     if (editingId !== null) return;
 
-    // Shift = Link-Modus
+    // Shift = Link-Modus oder Verbindung toggeln
     if (e.shiftKey && !e.ctrlKey && !e.metaKey) {
       e.preventDefault();
       e.stopPropagation();
       if (selectedId != null && selectedId !== id) {
+        // Verbindung zwischen zwei Knoten toggeln (erstellen oder löschen)
         pushHistory();
-        ensureEdge(selectedId, id);
+        const edgeBetween = edges.find(
+          (ed) =>
+            (ed.source === selectedId && ed.target === id) ||
+            (ed.source === id && ed.target === selectedId)
+        );
+        if (edgeBetween) {
+          // Verbindung existiert → löschen
+          setEdges((es) => es.filter((ed) => ed.id !== edgeBetween.id));
+        } else {
+          // Verbindung existiert nicht → erstellen
+          setEdges((es) => [
+            ...es,
+            {
+              id: Date.now(),
+              source: selectedId,
+              target: id,
+            },
+          ]);
+        }
         selectOnly(id);
         return;
       }
@@ -1203,7 +1212,7 @@ export default function App() {
         return;
       }
 
-      // Shift+Backspace oder Delete: löschen
+      // Shift+Backspace oder Delete: ganze Node/Kante löschen
       if (
         (e.key === "Backspace" && e.shiftKey) ||
         e.key === "Delete"
@@ -1214,14 +1223,36 @@ export default function App() {
         return;
       }
 
-      // Backspace: Text löschen (bei 1 Knoten), mehrere → löschen
-      if (e.key === "Backspace") {
+      // Backspace:
+      // - wenn Kante(n) ausgewählt: Label-Text löschen (Zeichenweise)
+      // - wenn mehrere Nodes: Nodes löschen
+      // - wenn 1 Node: Text im Node löschen (wie bisher)
+      if (e.key === "Backspace" && !e.shiftKey) {
         e.preventDefault();
+
+        // 1) Kante(n) ausgewählt → Label bearbeiten
+        if (selectedEdgeIds.size > 0) {
+          const edgeIds = Array.from(selectedEdgeIds);
+          pushHistory();
+          setEdges((prev) =>
+            prev.map((ed) => {
+              if (!edgeIds.includes(ed.id)) return ed;
+              const cur = ed.label ?? "";
+              const next = cur.slice(0, Math.max(0, cur.length - 1));
+              return { ...ed, label: next || undefined };
+            })
+          );
+          return;
+        }
+
+        // 2) mehrere Nodes → Nodes löschen
         const ids = Array.from(selectedIds);
         if (ids.length > 1) {
           removeNodes(ids);
           return;
         }
+
+        // 3) ein Node → Text des Knotens bearbeiten
         if (ids.length === 1) {
           const id = ids[0];
           pushHistory();
@@ -1476,7 +1507,7 @@ export default function App() {
             <path d="M6 2h9l5 5v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2z" />
             <path
               d="M12 8v6m0 0l-3-3m3 3l3-3"
-              stroke="white"
+              stroke="#ffffff"
               strokeWidth="2"
               fill="none"
               strokeLinecap="round"
@@ -1503,7 +1534,7 @@ export default function App() {
             <path d="M6 2h9l5 5v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2z" />
             <path
               d="M12 16V10m0 0l-3 3m3-3l3 3"
-              stroke="white"
+              stroke="#ffffff"
               strokeWidth="2"
               fill="none"
               strokeLinecap="round"
@@ -1518,6 +1549,85 @@ export default function App() {
           style={{ display: "none" }}
           onChange={handleFileChange}
         />
+      </div>
+
+      {/* Help-Button oben rechts */}
+      <div
+        style={{
+          position: "fixed",
+          top: 5,
+          right: 5,
+          zIndex: 1500,
+        }}
+        onMouseEnter={() => setShowHelp(true)}
+        onMouseLeave={() => setShowHelp(false)}
+      >
+        <button
+          onClick={() => setShowHelp((v) => !v)}
+          style={{
+            width: 26,
+            height: 26,
+            borderRadius: "50%",
+            border: "1px solid rgba(15,23,42,.18)",
+            background: "rgba(255,255,255,0.95)",
+            cursor: "pointer",
+            fontSize: 16,
+            fontWeight: 600,
+            lineHeight: "1",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            boxShadow: "0 4px 10px rgba(15,23,42,.12)",
+            color: "#0f172a",
+          }}
+        >
+          ?
+        </button>
+
+        {showHelp && (
+          <div
+            style={{
+              marginTop: 8,
+              right: 0,
+              position: "absolute",
+              background: "rgba(255,255,255,0.98)",
+              padding: "10px 12px",
+              borderRadius: 10,
+              boxShadow: "0 10px 28px rgba(15,23,42,.2)",
+              border: "1px solid rgba(15,23,42,.08)",
+              minWidth: 260,
+              fontSize: 12,
+              color: "#0f172a",
+            }}
+          >
+            <div
+              style={{
+                fontWeight: 600,
+                marginBottom: 6,
+                fontSize: 13,
+              }}
+            >
+              Shortcuts
+            </div>
+            <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+              <li><b>Enter</b> – Create child node</li>
+              <li><b>Shift + Enter</b> – Create sibling node</li>
+              <li><b>Arrow Keys</b> – Navigate to nearby node</li>
+              <li><b>Shift + Tab</b> – Go to parent / cycle back down</li>
+              <li><b>Tab</b> – Jump to previously selected node</li>
+              <li><b>Ctrl/Cmd + Z</b> – Undo</li>
+              <li><b>Ctrl/Cmd + Y</b> or <b>Shift + Ctrl/Cmd + Z</b> – Redo</li>
+              <li><b>Backspace</b> – Delete text (node) or edge label</li>
+              <li><b>Shift + Backspace</b> Delete node/edge</li>
+              <li><b>Shift + Drag</b> – Selection rectangle</li>
+              <li><b>Shift + Click + Drag</b> – Create edge</li>
+              <li><b>Ctrl/Cmd + Click</b> – Multi-select</li>
+              <li><b>Mouse wheel</b> – Zoom</li>
+              <li><b>Shift + Wheel</b> – Pan</li>
+              <li><b>Click Node A, then Node B</b> – Delete edge between them</li>
+            </ul>
+          </div>
+        )}
       </div>
 
       {/* Zeichenfläche */}
@@ -1546,6 +1656,26 @@ export default function App() {
         }}
       >
         <defs>
+          <marker
+            id="arrowhead"
+            markerWidth="10"
+            markerHeight="10"
+            refX="8"
+            refY="3"
+            orient="auto"
+          >
+            <polygon points="0 0, 10 3, 0 6" fill="#888" />
+          </marker>
+          <marker
+            id="arrowhead-selected"
+            markerWidth="10"
+            markerHeight="10"
+            refX="8"
+            refY="3"
+            orient="auto"
+          >
+            <polygon points="0 0, 10 3, 0 6" fill="#1976d2" />
+          </marker>
           <pattern
             id="dotGrid"
             width="32"
@@ -1643,7 +1773,7 @@ export default function App() {
                   x2={t.x}
                   y2={t.y}
                   stroke="transparent"
-                  strokeWidth={Math.max(12 / scale, 6)}
+                  strokeWidth={Math.max(20 / scale, 12)}
                   onPointerDown={onEdgePointerDown}
                   onContextMenu={(evt) => {
                     evt.preventDefault();
@@ -1669,6 +1799,7 @@ export default function App() {
                   strokeWidth={strokeWidth}
                   strokeDasharray={dash}
                   vectorEffect="non-scaling-stroke"
+                  markerEnd={isEdgeSelected ? "url(#arrowhead-selected)" : "url(#arrowhead)"}
                 />
                 {e.label && (
                   <g pointerEvents="none">
@@ -1758,7 +1889,6 @@ export default function App() {
                   e.preventDefault();
                   e.stopPropagation();
 
-                  // Mehrfachauswahl behalten, falls Node schon selektiert ist
                   if (!selectedIds.has(n.id)) {
                     selectOnly(n.id);
                   }
@@ -1824,7 +1954,7 @@ export default function App() {
                   ))}
                 </g>
 
-                {/* Unsichtbares Input */}
+                {/* Unsichtbares Input (für Direkt-Editing, Text im SVG bleibt sichtbar) */}
                 {isEditing && (
                   <foreignObject
                     x={-n.w / 2 + 8}
@@ -1862,7 +1992,7 @@ export default function App() {
                         height: "100%",
                         border: "none",
                         background: "transparent",
-                        color: "transparent",
+                        color: "transparent", // Text im SVG ist sichtbar, das Input nur für Caret
                         caretColor: isSelected
                           ? "#1976d2"
                           : "#000",
