@@ -4,9 +4,6 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { Toolbar } from "./components/Toolbar";
-import { HelpButton } from "./components/HelpButton";
-import { ContextMenu as ExternalContextMenu } from "./components/ContextMenu";
 
 /** --- Typen --- */
 type MindNode = {
@@ -192,6 +189,7 @@ export default function App() {
   );
 
   const [clipboard, setClipboard] = useState<{ nodes: MindNode[], edges: Link[] } | null>(null);
+  const [showHelp, setShowHelp] = useState(false);
 
   /** Pan & Zoom */
   const [pan, setPan] = useState(() => ({
@@ -261,7 +259,6 @@ export default function App() {
   });
 
   const freshTyping = useRef<boolean>(true);
-  const contextMenuHandled = useRef<boolean>(false);
 
   const undoStack = useRef<Snapshot[]>([]);
   const redoStack = useRef<Snapshot[]>([]);
@@ -587,13 +584,6 @@ export default function App() {
   function onPointerDownNode(e: React.PointerEvent<SVGGElement>, id: number) {
     if (editingId !== null) return;
 
-    // Rechtsklick: nur selektieren, kein Drag/Linking starten
-    if (e.button === 2) {
-      e.stopPropagation();
-      if (!selectedIds.has(id)) selectOnly(id);
-      return;
-    }
-
     if (e.shiftKey && !e.ctrlKey && !e.metaKey) {
       e.preventDefault(); e.stopPropagation();
       
@@ -658,10 +648,6 @@ export default function App() {
   }
 
   function onPointerDownSvg(e: React.PointerEvent<SVGSVGElement>) {
-    // Rechtsklick ignorieren, damit kein Pointer Capture stattfindet und
-    // das contextmenu-Event beim eigentlichen Ziel (Node/Edge) ankommt.
-    if (e.button === 2) return;
-
     (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
     activeTouches.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (activeTouches.current.size === 2) {
@@ -973,28 +959,37 @@ export default function App() {
         fontFamily: "Inter, system-ui, -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif",
       }}
       onClick={() => { if (contextMenu.open) setContextMenu({ ...contextMenu, open: false }); }}
-      onContextMenu={(e) => {
-        e.preventDefault();
-
-        // Wenn bereits ein Node- oder Edge-Menü aktiv ist, Hintergrund-Menü nicht erneut öffnen
-        if (contextMenu.open && contextMenu.kind !== "bg") {
-          contextMenuHandled.current = false;
-          return;
-        }
-
-        if (!contextMenuHandled.current) {
-          const w = toWorld(e.clientX, e.clientY);
-          setContextMenu({ open: true, x: e.clientX, y: e.clientY, wx: w.x, wy: w.y, kind: "bg" });
-        }
-        contextMenuHandled.current = false;
-      }}
     >
       {/* Hilfe Icon */}
-      <HelpButton />
+      <div 
+        style={{position:'fixed', top: 10, right: 10, zIndex: 1000}}
+        onMouseEnter={() => setShowHelp(true)}
+        onMouseLeave={() => setShowHelp(false)}
+      >
+          <div style={{width: 32, height: 32, borderRadius: '50%', background: '#fff', boxShadow: '0 2px 8px rgba(0,0,0,0.1)', display:'flex', alignItems:'center', justifyContent:'center', fontWeight:'bold', color: '#555', cursor:'help', border:'1px solid #ddd'}}>?</div>
+          {showHelp && (
+              <div style={{position:'absolute', top: 40, right: 0, width: 220, background:'white', padding: 12, borderRadius: 8, boxShadow: '0 4px 12px rgba(0,0,0,0.15)', fontSize: 12, lineHeight: 1.6, border: '1px solid #eee'}}>
+                  <strong>Shortcuts</strong><br/>
+                  <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap: 4}}>
+                  <span>Enter</span> <span>Add Child</span>
+                      <span>Shift+Enter</span> <span>Add Sibling</span>
+                      <span>Shift+Drag</span> <span>Connect (Arrow)</span>
+                      <span>Shift+Click</span> <span>Connect (Line)</span>
+                      <span>Ctrl+B</span> <span>Highlight</span>
+                      <span>Ctrl+C/V</span> <span>Copy / Paste</span>
+                      <span>Arrow Keys</span> <span>Navigate</span>
+                      <span>Tab</span> <span>Switch Node</span>
+                  </div>
+              </div>
+          )}
+      </div>
 
       {/* Toolbar */}
-      <Toolbar onExport={exportToFile} onImportClick={() => fileInputRef.current?.click()} />
-      <input ref={fileInputRef} type="file" accept="application/json" style={{ display: "none" }} onChange={handleFileChange} />
+      <div style={{ position: "fixed", top: 5, left: 5, zIndex: 1500, display: "flex", gap: 10, background: "rgba(255,255,255,0.9)", padding: "5px 5px", borderRadius: 10, boxShadow: "0 4px 12px rgba(0,0,0,.12)", border: "1px solid rgba(0,0,0,.06)" }}>
+        <button onClick={exportToFile} style={{ border: "none", background: "transparent", cursor: "pointer" }}>💾</button>
+        <button onClick={() => fileInputRef.current?.click()} style={{ border: "none", background: "transparent", cursor: "pointer" }}>📂</button>
+        <input ref={fileInputRef} type="file" accept="application/json" style={{ display: "none" }} onChange={handleFileChange} />
+      </div>
 
       <svg
         ref={svgRef} width="100%" height="100%"
@@ -1015,7 +1010,7 @@ export default function App() {
           </marker>
         </defs>
         <g transform={`translate(${pan.x},${pan.y}) scale(${scale})`}>
-          <rect x={-5000} y={-5000} width={10000} height={10000} fill="url(#dotGrid)" onPointerDown={onPointerDownBg} />
+          <rect x={-5000} y={-5000} width={10000} height={10000} fill="url(#dotGrid)" onPointerDown={onPointerDownBg} onContextMenu={(e) => { e.preventDefault(); const w = toWorld(e.clientX, e.clientY); setContextMenu({ open: true, x: e.clientX, y: e.clientY, wx: w.x, wy: w.y, kind: "bg" }); }} />
 
           {edges.map((e) => {
             const s = nodes.find((n) => n.id === e.source);
@@ -1037,38 +1032,17 @@ export default function App() {
                setSelectedEdgeIds((prev) => { const next = new Set(prev); if (evt.shiftKey) { if (next.has(e.id)) next.delete(e.id); else next.add(e.id); } else { next.clear(); next.add(e.id); } return next; }); freshTyping.current = true;
             };
 
-            // Position der Beschriftung etwas oberhalb der Mitte der Linie
             const mx = (s.x + tx) / 2;
             const my = (s.y + ty) / 2;
 
             return (
               <g key={e.id}>
-                <line x1={s.x} y1={s.y} x2={tx} y2={ty} stroke="transparent" strokeWidth={Math.max(24 / scale, 10)} onPointerDown={onEdgePointerDown} onContextMenu={(evt) => { evt.preventDefault(); evt.stopPropagation(); contextMenuHandled.current = true; setSelectedIds(new Set()); setSelectedId(null); setSelectedEdgeIds(new Set([e.id])); setContextMenu({ open: true, x: evt.clientX, y: evt.clientY, kind: "edge", targetEdgeId: e.id }); }} />
+                <line x1={s.x} y1={s.y} x2={tx} y2={ty} stroke="transparent" strokeWidth={Math.max(12 / scale, 6)} onPointerDown={onEdgePointerDown} onContextMenu={(evt) => { evt.preventDefault(); evt.stopPropagation(); setSelectedIds(new Set()); setSelectedId(null); setSelectedEdgeIds(new Set([e.id])); setContextMenu({ open: true, x: evt.clientX, y: evt.clientY, kind: "edge", targetEdgeId: e.id }); }} />
                 <line x1={s.x} y1={s.y} x2={tx} y2={ty} stroke={stroke} strokeWidth={strokeWidth} strokeDasharray={dash} vectorEffect="non-scaling-stroke" markerEnd={marker} />
                 {e.label && (
                   <g pointerEvents="none">
-                    {/* Weicher weißer Bereich hinter der Schrift, der die Linie optisch zurücknimmt */}
-                    <rect
-                      x={mx - e.label.length * 5}
-                      y={my - 16}
-                      width={Math.max(30, e.label.length * 10)}
-                      height={22}
-                      rx={11}
-                      ry={11}
-                      fill="rgba(255,255,255,0.5)"
-                    />
-                    <text
-                      x={mx}
-                      y={my - 2}
-                      textAnchor="middle"
-                      fontSize={18}
-                      fontFamily="Inter, system-ui, -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif"
-                      fontWeight={500}
-                      letterSpacing={0.2}
-                      fill={isEdgeSelected ? "#1976d2" : "#0f172a"}
-                    >
-                      {e.label}
-                    </text>
+                    <rect x={mx - e.label.length * 6} y={my - 10} width={Math.max(24, e.label.length * 12)} height={20} rx={6} ry={6} fill="rgba(255,255,255,0.95)" stroke="rgba(15,23,42,0.08)" strokeWidth={0.5} />
+                    <text x={mx} y={my + 5} textAnchor="middle" fontSize={12} fill={isEdgeSelected ? "#1976d2" : "#0f172a"}>{e.label}</text>
                   </g>
                 )}
               </g>
@@ -1092,30 +1066,7 @@ export default function App() {
             const strokeW = n.bold ? 4 : (isSelected ? 2.5 : 1.5);
 
             return (
-                <g
-                  key={n.id}
-                  transform={`translate(${n.x},${n.y})`}
-                  onPointerDown={(e) => onPointerDownNode(e, n.id)}
-                  onDoubleClick={() => {
-                    selectOnly(n.id);
-                    freshTyping.current = true;
-                  }}
-                  onContextMenu={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    // Testausgabe, um zu sehen, ob Rechtsklick auf Node ankommt
-                    console.log("Right click on node", n.id);
-                    contextMenuHandled.current = true;
-                    if (!selectedIds.has(n.id)) selectOnly(n.id);
-                    setContextMenu({
-                      open: true,
-                      x: e.clientX,
-                      y: e.clientY,
-                      kind: "node",
-                      targetNodeId: n.id,
-                    });
-                  }}
-                >
+              <g key={n.id} transform={`translate(${n.x},${n.y})`} onPointerDown={(e) => onPointerDownNode(e, n.id)} onDoubleClick={() => { selectOnly(n.id); freshTyping.current = true; }} onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); if (!selectedIds.has(n.id)) selectOnly(n.id); setContextMenu({ open: true, x: e.clientX, y: e.clientY, kind: "node", targetNodeId: n.id }); }}>
                 <rect x={-n.w / 2} y={-n.h / 2} width={n.w} height={n.h} rx={corner} ry={corner} fill={n.fillColor || "#ffffff"} />
                 <rect x={-n.w / 2} y={-n.h / 2} width={n.w} height={n.h} rx={corner} ry={corner} fill="none" stroke={stroke} strokeWidth={strokeW} vectorEffect="non-scaling-stroke" />
                 <g pointerEvents="none">
@@ -1135,71 +1086,54 @@ export default function App() {
         </g>
       </svg>
 
-      <ExternalContextMenu
-        contextMenu={contextMenu}
-        nodes={nodes}
-        selectedIds={selectedIds}
-        undoStack={undoStack}
-        redoStack={redoStack}
-        onClose={() => setContextMenu({ ...contextMenu, open: false })}
-        onAddStandalone={addStandalone}
-        onSelectOnly={selectOnly}
-        onRenameNode={(id, _label) => {
-          setEditingId(id);
-          setEditingText(nodes.find((n) => n.id === id)?.label || "");
-        }}
-        onAddChild={addChild}
-        onHighlightNodes={(ids) => {
-          pushHistory();
-          setNodes((prev) =>
-            prev.map((n) =>
-              ids.includes(n.id) ? { ...n, bold: !n.bold } : n
-            )
-          );
-        }}
-        onSetNodeColor={(ids, color) => {
-          pushHistory();
-          setNodes((prev) =>
-            prev.map((n) =>
-              ids.includes(n.id) ? { ...n, fillColor: color } : n
-            )
-          );
-        }}
-        onRemoveNodes={removeNodes}
-        onToggleEdgeDashed={(edgeId) => {
-          pushHistory();
-          setEdges((prev) =>
-            prev.map((ed) =>
-              ed.id === edgeId ? { ...ed, dashed: !ed.dashed } : ed
-            )
-          );
-        }}
-        onToggleEdgeArrow={(edgeId) => {
-          pushHistory();
-          setEdges((prev) =>
-            prev.map((ed) =>
-              ed.id === edgeId ? { ...ed, arrow: !ed.arrow } : ed
-            )
-          );
-        }}
-        onRenameEdge={(edgeId) => {
-          const ed = edges.find((x) => x.id === edgeId);
-          const next = window.prompt("Label for edge:", ed?.label ?? "");
-          if (next !== null) {
-            pushHistory();
-            setEdges((prev) =>
-              prev.map((e) =>
-                e.id === edgeId
-                  ? { ...e, label: next.trim() || undefined }
-                  : e
-              )
-            );
-          }
-        }}
-        onRemoveEdges={removeEdges}
-        onUndo={undo}
-        onRedo={redo}
-      />
+      {contextMenu.open && (
+        <div style={{ position: "fixed", left: contextMenu.x, top: contextMenu.y, zIndex: 2000, background: "#ffffff", borderRadius: 10, boxShadow: "0 8px 24px rgba(15,23,42,.18)", padding: 6, minWidth: 240, border: "1px solid rgba(15,23,42,.06)" }} onClick={(e) => e.stopPropagation()}>
+          {contextMenu.kind === "bg" && (
+            <>
+              <MenuItem label="➕ New Node" onClick={() => { const id = contextMenu.wx != null ? addStandalone({ x: contextMenu.wx, y: contextMenu.wy! }) : addStandalone(); selectOnly(id); setContextMenu({ ...contextMenu, open: false }); }} />
+              <div style={{ height: 1, background: "rgba(15,23,42,.08)", margin: "6px 0" }} />
+              <MenuItem label="💾 Export" onClick={() => { exportToFile(); setContextMenu({ ...contextMenu, open: false }); }} />
+              <MenuItem label="📂 Import" onClick={() => { fileInputRef.current?.click(); setContextMenu({ ...contextMenu, open: false }); }} />
+              <div style={{ height: 1, background: "rgba(15,23,42,.08)", margin: "6px 0" }} />
+              <MenuItem label="↶ Undo (Ctrl+Z)" onClick={() => { undo(); setContextMenu({ ...contextMenu, open: false }); }} disabled={undoStack.current.length === 0} />
+              <MenuItem label="↷ Redo (Ctrl+Y)" onClick={() => { redo(); setContextMenu({ ...contextMenu, open: false }); }} disabled={redoStack.current.length === 0} />
+            </>
+          )}
+          
+          {contextMenu.kind === "node" && (
+            <>
+              <MenuItem label="✏️ Rename" onClick={() => { if (contextMenu.targetNodeId != null) { setEditingId(contextMenu.targetNodeId); setEditingText(nodes.find((n) => n.id === contextMenu.targetNodeId)?.label || ""); } setContextMenu({ ...contextMenu, open: false }); }} />
+              <MenuItem label="➕ Child" onClick={() => { if (contextMenu.targetNodeId != null) selectOnly(addChild(contextMenu.targetNodeId)); setContextMenu({ ...contextMenu, open: false }); }} />
+              <MenuItem label="⭐ Highlight (Strg+B)" onClick={() => { 
+                  if (contextMenu.targetNodeId != null) { 
+                      pushHistory(); 
+                      const ids = Array.from(selectedIds);
+                      setNodes(prev => prev.map(n => ids.includes(n.id) ? { ...n, bold: !n.bold } : n));
+                  } 
+                  setContextMenu({ ...contextMenu, open: false }); 
+              }} />
+              <div style={{ height: 1, background: "rgba(15,23,42,.08)", margin: "6px 0" }} />
+              <MenuItem label="🗑️ Delete" onClick={() => { if (contextMenu.targetNodeId != null) removeNodes([contextMenu.targetNodeId]); setContextMenu({ ...contextMenu, open: false }); }} />
+            </>
+          )}
+
+          {contextMenu.kind === "edge" && (
+            <>
+              <MenuItem label="╌╌╌ Toggle dashed" onClick={() => { if (contextMenu.targetEdgeId != null) { pushHistory(); setEdges((prev) => prev.map((ed) => ed.id === contextMenu.targetEdgeId ? { ...ed, dashed: !ed.dashed } : ed)); } setContextMenu({ ...contextMenu, open: false }); }} />
+              <MenuItem label="➔ Toggle Arrow" onClick={() => { if (contextMenu.targetEdgeId != null) { pushHistory(); setEdges((prev) => prev.map((ed) => ed.id === contextMenu.targetEdgeId ? { ...ed, arrow: !ed.arrow } : ed)); } setContextMenu({ ...contextMenu, open: false }); }} />
+              <MenuItem label="✏️ Rename edge" onClick={() => { if (contextMenu.targetEdgeId != null) { const ed = edges.find((x) => x.id === contextMenu.targetEdgeId); const next = window.prompt("Label for edge:", ed?.label ?? ""); if (next !== null) { pushHistory(); setEdges((prev) => prev.map((e) => e.id === contextMenu.targetEdgeId ? { ...e, label: next.trim() || undefined } : e)); } } setContextMenu({ ...contextMenu, open: false }); }} />
+              <div style={{ height: 1, background: "rgba(15,23,42,.08)", margin: "6px 0" }} />
+              <MenuItem label="🗑️ Delete edge" onClick={() => { if (contextMenu.targetEdgeId != null) removeEdges([contextMenu.targetEdgeId]); setContextMenu({ ...contextMenu, open: false }); }} />
+            </>
+          )}
+        </div>
+      )}
     </div>
+  );
+}
+
+function MenuItem({ label, onClick, disabled }: { label: string; onClick?: () => void; disabled?: boolean }) {
+  return (
+    <button onClick={disabled ? undefined : onClick} disabled={disabled} style={{ width: "100%", textAlign: "left", padding: "8px 12px", border: "none", background: "transparent", cursor: disabled ? "not-allowed" : "pointer", borderRadius: 8, color: disabled ? "#9ca3af" : "#0f172a", fontSize: 13 }} onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "rgba(37,99,235,.08)"; }} onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "transparent"; }}>{label}</button>
   );
 }
